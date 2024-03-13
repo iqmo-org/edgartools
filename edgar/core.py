@@ -25,13 +25,6 @@ from retry.api import retry_call
 from rich.logging import RichHandler
 from rich.prompt import Prompt
 
-# Rich logging
-logging.basicConfig(
-    level="INFO",
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True)]
-)
 
 log = logging.getLogger(__name__)
 
