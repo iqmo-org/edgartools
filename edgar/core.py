@@ -298,14 +298,6 @@ def http_client():
                             default_encoding=autodetect)
     return client
     
-def async_http_client():
-    log.info("Creating new HTTP client")
-    return httpx.AsyncClient(headers=client_headers(),
-                             timeout=edgar_mode.http_timeout,
-                             limits=edgar_mode.limits,
-                             default_encoding=autodetect)
-
-
 def get_json(data_url: str):
     client = http_client()
     r = client.get(data_url)
