@@ -309,22 +309,23 @@ def get_filings_for_quarters(year_and_quarters: YearAndQuarters,
     :param index: The index to use - "form", "company", or "xbrl"
     :return:
     """
-    with http_client() as client:
-        if len(year_and_quarters) == 1:
-            _, final_index_table = fetch_filing_index(year_and_quarter=year_and_quarters[0],
-                                                      client=client,
-                                                      index=index)
-        else:
-            quarters_and_indexes = parallel(fetch_filing_index,
-                                            items=year_and_quarters,
-                                            client=client,
-                                            index=index,
-                                            threadpool=True,
-                                            progress=True
-                                            )
-            quarter_and_indexes_sorted = sorted(quarters_and_indexes, key=lambda d: d[0])
-            index_tables = [fd[1] for fd in quarter_and_indexes_sorted]
-            final_index_table: pa.Table = pa.concat_tables(index_tables, mode="default")
+    client = http_client()
+
+    if len(year_and_quarters) == 1:
+        _, final_index_table = fetch_filing_index(year_and_quarter=year_and_quarters[0],
+                                                    client=client,
+                                                    index=index)
+    else:
+        quarters_and_indexes = parallel(fetch_filing_index,
+                                        items=year_and_quarters,
+                                        client=client,
+                                        index=index,
+                                        threadpool=True,
+                                        progress=True
+                                        )
+        quarter_and_indexes_sorted = sorted(quarters_and_indexes, key=lambda d: d[0])
+        index_tables = [fd[1] for fd in quarter_and_indexes_sorted]
+        final_index_table: pa.Table = pa.concat_tables(index_tables, mode="default")
     return final_index_table
 
 
@@ -1602,7 +1603,7 @@ class Filing:
             markdown_content = MarkdownContent(self.html())
             markdown_content.view()
 
-    def xbrl(self) -> Optional[FilingXbrl]:
+    def xbrl(self, download_only: bool = False) -> Optional[FilingXbrl]:
         """
         Get the XBRL document for the filing, parsed and as a FilingXbrl object
         :return: Get the XBRL document for the filing, parsed and as a FilingXbrl object, or None
@@ -1610,7 +1611,14 @@ class Filing:
         xbrl_document = self.homepage.xbrl_document
         if xbrl_document:
             xbrl_text = xbrl_document.download()
-            return FilingXbrl.parse(xbrl_text)
+
+            if xbrl_text is None:
+                log.info("No XBRL result")
+
+            if download_only: 
+                return None
+            else:
+                return FilingXbrl.parse(xbrl_text)
 
     @property
     @lru_cache(maxsize=1)

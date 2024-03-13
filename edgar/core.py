@@ -1,6 +1,5 @@
 import datetime
 import gzip
-import logging.config
 import os
 import random
 import re
@@ -13,7 +12,7 @@ from decimal import Decimal
 from functools import lru_cache
 from io import BytesIO
 from typing import Union, Optional, Tuple, List
-
+import logging
 import httpx
 import humanize
 import pandas as pd
@@ -22,7 +21,7 @@ import pyarrow.compute as pc
 from charset_normalizer import detect
 from fastcore.basics import listify
 from retry.api import retry_call
-from rich.logging import RichHandler
+#from rich.logging import RichHandler
 from rich.prompt import Prompt
 
 
@@ -34,8 +33,6 @@ pandas_version = tuple(map(int, pd.__version__.split('.')))
 # sys version
 python_version = tuple(map(int, sys.version.split()[0].split('.')))
 
-# Turn down 3rd party logging
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 __all__ = [
     'log',
@@ -289,13 +286,18 @@ def autodetect(content):
 def client_headers():
     return {'User-Agent': get_identity()}
 
+client = None
 def http_client():
-    log.info("Creating new HTTP client")
-    return httpx.Client(headers=client_headers(),
-                        timeout=edgar_mode.http_timeout,
-                        limits=edgar_mode.limits,
-                        default_encoding=autodetect)
+    global client
+    if client is None:
 
+        log.info("Creating new HTTP client")
+        client = httpx.Client(headers=client_headers(),
+                            timeout=edgar_mode.http_timeout,
+                            limits=edgar_mode.limits,
+                            default_encoding=autodetect)
+    return client
+    
 def async_http_client():
     log.info("Creating new HTTP client")
     return httpx.AsyncClient(headers=client_headers(),
@@ -305,11 +307,11 @@ def async_http_client():
 
 
 def get_json(data_url: str):
-    with http_client() as client:
-        r = client.get(data_url)
-        if r.status_code == 200:
-            return r.json()
-        r.raise_for_status()
+    client = http_client()
+    r = client.get(data_url)
+    if r.status_code == 200:
+        return r.json()
+    r.raise_for_status()
 
 
 def decode_content(content: bytes):
@@ -362,11 +364,10 @@ def download_text(url: str, client: Union[httpx.Client, httpx.AsyncClient] = Non
 
 
 def download_json(data_url: str):
-    with http_client() as client:
-        r = client.get(data_url)
-        if r.status_code == 200:
-            return r.json()
-        r.raise_for_status()
+    r = http_client().get(data_url)
+    if r.status_code == 200:
+        return r.json()
+    r.raise_for_status()
 
 
 def get_text_between_tags(url: str, tag: str, client: Union[httpx.Client, httpx.AsyncClient] = None):
