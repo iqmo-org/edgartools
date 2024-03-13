@@ -33,7 +33,7 @@ logging.basicConfig(
     handlers=[RichHandler(rich_tracebacks=True)]
 )
 
-log = logging.getLogger("rich")
+log = logging.getLogger(__name__)
 
 # Pandas version
 pandas_version = tuple(map(int, pd.__version__.split('.')))
@@ -296,15 +296,15 @@ def autodetect(content):
 def client_headers():
     return {'User-Agent': get_identity()}
 
-
 def http_client():
+    log.info("Creating new HTTP client")
     return httpx.Client(headers=client_headers(),
                         timeout=edgar_mode.http_timeout,
                         limits=edgar_mode.limits,
                         default_encoding=autodetect)
 
-
 def async_http_client():
+    log.info("Creating new HTTP client")
     return httpx.AsyncClient(headers=client_headers(),
                              timeout=edgar_mode.http_timeout,
                              limits=edgar_mode.limits,
