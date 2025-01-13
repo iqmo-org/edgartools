@@ -1,17 +1,24 @@
 from datetime import datetime
 from functools import lru_cache, partial
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+from rich import box
 from rich import print
 from rich.console import Group, Text
+from rich.padding import Padding
 from rich.panel import Panel
+from rich.table import Table
+from rich.tree import Tree
 
-from edgar._rich import repr_rich
-from edgar._markdown import MarkdownContent
 from edgar._filings import Attachments, Attachment
+from edgar._markdown import MarkdownContent
+from edgar.core import datefmt
+from edgar.files.html import Document
+from edgar.files.html_documents import HtmlDocument
+from edgar.files.htmltools import ChunkedDocument, chunks2df, detect_decimal_items, adjust_for_empty_items
 from edgar.financials import Financials
-from edgar.documents import HtmlDocument
-from edgar.htmltools import ChunkedDocument, chunks2df, detect_decimal_items, adjust_for_empty_items
+from edgar.richtools import repr_rich
+from edgar.richtools import rich_to_text
 
 __all__ = [
     'TenK',
@@ -19,6 +26,7 @@ __all__ = [
     'TwentyF',
     'EightK',
     'PressRelease',
+    'PressReleases',
     'is_valid_item_for_filing'
 ]
 
@@ -42,22 +50,24 @@ class CompanyReport:
 
     @property
     def income_statement(self):
-        return self.financials.income_statement if self.financials else None
+        return self.financials.get_income_statement() if self.financials else None
 
     @property
     def balance_sheet(self):
-        return self.financials.balance_sheet if self.financials else None
+        return self.financials.get_balance_sheet() if self.financials else None
 
     @property
     def cash_flow_statement(self):
-        return self.financials.cash_flow_statement if self.financials else None
+        return self.financials.get_cash_flow_statement() if self.financials else None
 
     @property
     @lru_cache(1)
     def financials(self):
-        xbrl = self._filing.xbrl()
-        if xbrl:
-            return Financials.from_xbrl(xbrl)
+        return Financials.extract(self._filing)
+
+    @property
+    def period_of_report(self):
+        return self._filing.header.period_of_report
 
     @property
     @lru_cache(maxsize=1)
@@ -232,8 +242,86 @@ class TenK(CompanyReport):
         assert filing.form in ['10-K', '10-K/A'], f"This form should be a 10-K but was {filing.form}"
         super().__init__(filing)
 
+    @property
+    def business(self):
+        return self['Item 1']
+
+    @property
+    def risk_factors(self):
+        return self['Item 1A']
+
+    @property
+    def management_discussion(self):
+        return self['Item 7']
+
+    @property
+    def directors_officers_and_governance(self):
+        return self['Item 10']
+
     def __str__(self):
         return f"""TenK('{self.company}')"""
+
+    def get_structure(self):
+        # Create the main tree
+        tree = Tree("📄 ")
+
+        # Get the actual items from the filing
+        actual_items = self.items
+
+        # Create a mapping of uppercase to actual case items
+        case_mapping = {item.upper(): item for item in actual_items}
+
+        # Process each part in the structure
+        for part, items in self.structure.structure.items():
+            # Create a branch for each part
+            part_tree = tree.add(f"[bold blue]{part}[/]")
+
+            # Add items under each part
+            for item_key, item_data in items.items():
+                # Check if this item exists in the actual filing
+                if item_key in case_mapping:
+                    # Use the actual case from the filing
+                    actual_item = case_mapping[item_key]
+                    item_text = Text.assemble(
+                        (f"{actual_item:<7} ", "bold green"),
+                        (f"{item_data['Title']}", "bold"),
+                    )
+                else:
+                    # Item doesn't exist - show in grey with original structure case
+                    item_text = Text.assemble(
+                        (f"{item_key}: ", "dim"),
+                        (f"{item_data['Title']}", "dim"),
+                    )
+
+                part_tree.add(item_text)
+
+        return tree
+
+    def __rich__(self):
+        title = Text.assemble(
+            (f"{self.company}", "bold deep_sky_blue1"),
+            (" ", ""),
+            (f"{self.form}", "bold"),
+        )
+        periods = Text.assemble(
+            ("Period ending ", "grey70"),
+            (f"{datefmt(self.period_of_report, '%B %d, %Y')}", "bold"),
+            (" filed on ", "grey70"),
+            (f"{datefmt(self.filing_date, '%B %d, %Y')}", "bold"),
+
+        )
+        panel = Panel(
+            Group(
+                periods,
+                Padding(" ", (1, 0, 0, 0)),
+                self.get_structure(),
+                Padding(" ", (1, 0, 0, 0)),
+                self.financials or Text("No financial data available", style="italic")
+            ),
+            title=title,
+            box=box.ROUNDED,
+        )
+        return panel
 
 
 class TenQ(CompanyReport):
@@ -490,23 +578,20 @@ class EightK():
 
     @property
     def has_press_release(self):
-        attachments: Attachments = self._filing.attachments
-        # press release is Type EX-99.1
-        return attachments.query("Type=='EX-99.1'") is not None
+        return self.press_releases is not None
 
     @property
-    def press_release(self):
+    def press_releases(self):
         attachments: Attachments = self._filing.attachments
-        # press release is Type EX-99.1
-        press_release_results = attachments.query("Type=='EX-99.1' & Document.str.contains('htm')")
+        # This query for press release currently includes EX-99, EX-99.1, EX-99.01 but not EX-99.2
+        # Here is what we think so far
+        html_document = "document.endswith('.htm')"
+        named_release = "re.match('.*RELEASE', description)"
+        type_ex_99 = "document_type in ['EX-99.1', 'EX-99', 'EX-99.01']"
+        press_release_query = f"{html_document} and ({named_release} or {type_ex_99})"
+        press_release_results = attachments.query(press_release_query)
         if press_release_results:
-            if isinstance(press_release_results, Attachment):
-                return PressRelease(press_release_results)
-            elif isinstance(press_release_results, Attachments):
-                for i in range(0, len(press_release_results)):
-                    attachment = press_release_results[i]
-                    if attachment.document.endswith('.htm') or attachment.document.endswith('.html'):
-                        return PressRelease(attachment)
+            return PressReleases(press_release_results)
 
     @property
     def filing_date(self):
@@ -523,11 +608,15 @@ class EightK():
     @property
     @lru_cache(maxsize=1)
     def chunked_document(self):
+        html = self._filing.html()
+        if not html:
+            return None
         decimal_chunk_fn = partial(chunks2df,
                                    item_detector=detect_decimal_items,
                                    item_adjuster=adjust_for_empty_items,
                                    item_structure=self.structure)
-        return ChunkedDocument(self._filing.html(),
+
+        return ChunkedDocument(html,
                                chunk_fn=decimal_chunk_fn)
 
     @property
@@ -536,7 +625,9 @@ class EightK():
 
     @property
     def items(self) -> List[str]:
-        return self.chunked_document.list_items()
+        if self.chunked_document:
+            return self.chunked_document.list_items()
+        return []
 
     def __getitem__(self, item_or_part: str):
         # Show the item or part from the filing document. e.g. Item 1 Business from 10-K or Part I from 10-Q
@@ -552,18 +643,106 @@ class EightK():
     @property
     def date_of_report(self):
         """Return the period of report for this filing"""
-        period_of_report = datetime.strptime(self._filing.header.period_of_report, "%Y%m%d")
-        return period_of_report.strftime("%B %d, %Y")
+        period_of_report_str = self._filing.header.period_of_report
+        if period_of_report_str:
+            period_of_report = datetime.strptime(period_of_report_str, "%Y-%m-%d")
+            return period_of_report.strftime("%B %d, %Y")
+        return ""
+
+    def _get_exhibit_content(self, exhibit: Attachment) -> Optional[str]:
+        """
+        Get the content of the exhibit
+        """
+        # For old filings the exhibit might not have a document. So we need to get the full text content
+        # from the sgml content
+        if exhibit.empty:
+            # Download the SGML document
+            sgml_document = self._filing.filing_sgml.get_by_sequence(exhibit.sequence_number)
+            if sgml_document:
+                exhibit_content = sgml_document.text()
+                return exhibit_content
+        else:
+            html_content = exhibit.download()
+            if html_content:
+                document = Document.parse(html_content)
+                return rich_to_text(document, 200)
+
+    def _content_renderables(self):
+        """Get the content of the exhibits as renderables"""
+        renderables = []
+        for exhibit in self._filing.exhibits:
+            # Skip binary files
+            if exhibit.is_binary():
+                continue
+            exhibit_content = self._get_exhibit_content(exhibit)
+
+            if exhibit_content:
+                title = Text.assemble(("Exhibit ", "bold gray54"), (exhibit.document_type, "bold green"))
+                renderables.append(Panel(exhibit_content,
+                                         title=title,
+                                         subtitle=Text(exhibit.description, style="gray54"),
+                                         box=box.ROUNDED))
+        return Group(*renderables)
+
+    def text(self):
+        """Get the text of the EightK filing
+           This includes the text content of all the exhibits
+        """
+        return rich_to_text(self._content_renderables())
 
     def __rich__(self):
-        item_renderables = []
-        for item in self.items:
-            item_renderables.append(Text(self[item]))
+
+        # Renderables for the panel.
+        renderables = []
+
+        # List the exhibits as a table
+        exhibit_table = Table("", "Type", "Description",
+                      title="Exhibits", show_header=True, header_style="bold", box=box.ROUNDED)
+        renderables.append(exhibit_table)
+        for exhibit in self._filing.exhibits:
+            exhibit_table.add_row(exhibit.sequence_number, exhibit.document_type, exhibit.description)
+
+        panel_title = Text.assemble(
+            (f"{self.company}", "bold deep_sky_blue1"),
+            (" ", ""),
+            (f"{self.form}", "bold green"),
+            (" ", ""),
+            (f"{self.date_of_report}", "bold yellow")
+        )
+
+        # Add the content of the exhibits
+        renderables.append(self._content_renderables())
 
         return Panel(
-            Group(*item_renderables),
-            title=f"{self._filing.company} 8-K {self.date_of_report}"
+            Group(*renderables),
+            title=panel_title
         )
+
+    def __str__(self):
+        return f"{self.company} {self.form} {self.date_of_report}"
+
+    def __repr__(self):
+        return repr_rich(self.__rich__())
+
+
+class PressReleases:
+    """
+    Represent the attachment on an 8-K filing that could be press releases
+    """
+
+    def __init__(self, attachments: Attachments):
+        self.attachments: Attachments = attachments
+
+    def __len__(self):
+        return len(self.attachments)
+
+    def __getitem__(self, item):
+        attachment = self.attachments[item]
+        if attachment:
+            return PressRelease(attachment)
+
+    def __rich__(self):
+        return self.attachments.__rich__()
 
     def __repr__(self):
         return repr_rich(self.__rich__())
@@ -578,9 +757,16 @@ class PressRelease:
     def __init__(self, attachment: Attachment):
         self.attachment: Attachment = attachment
 
+    def url(self):
+        return self.attachment.url
+
     @property
     def document(self) -> str:
         return self.attachment.document
+
+    @property
+    def description(self) -> str:
+        return self.attachment.description
 
     @lru_cache(maxsize=1)
     def html(self) -> str:
@@ -589,7 +775,7 @@ class PressRelease:
     def text(self) -> str:
         html = self.html()
         if html:
-            return HtmlDocument.from_html(html).text
+            return HtmlDocument.from_html(html, extract_data=False).text
 
     def open(self):
         self.attachment.open()
@@ -599,7 +785,7 @@ class PressRelease:
 
     def to_markdown(self):
         html = self.html()
-        markdown_content = MarkdownContent(html, title="8-K Press Release")
+        markdown_content = MarkdownContent.from_html(html, title="8-K Press Release")
         return markdown_content
 
     def __rich__(self):

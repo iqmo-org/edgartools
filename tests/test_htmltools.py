@@ -1,18 +1,21 @@
+import warnings
 from pathlib import Path
 
 import pandas as pd
-from bs4 import BeautifulSoup
+from bs4 import XMLParsedAsHTMLWarning
 from rich import print
 
 from edgar import Filing
 from edgar.company_reports import EightK
-from edgar.htmltools import (
-    table_html_to_dataframe,
-    html_to_text, html_sections, dataframe_to_text, ChunkedDocument)
+from edgar.datatools import table_html_to_dataframe
+from edgar.files.htmltools import (
+    html_to_text, html_sections, ChunkedDocument, )
 
 pd.options.display.max_columns = 12
 pd.options.display.max_colwidth = 100
 pd.options.display.width = 1000
+
+
 
 Nvidia_2021_10k = Path("data/Nvidia.10-K.html").read_text()
 
@@ -46,12 +49,6 @@ def test_tricky_table_html2_dataframe():
     print(df)
 
 
-def test_dataframe_to_text():
-    df = pd.DataFrame({'A': [1, 2, 3], 'B': [4, 5, 6]})
-    text = dataframe_to_text(df)
-    assert "1" in text
-
-
 def test_html2text():
     tenk_text = html_to_text(Nvidia_2021_10k)
 
@@ -81,8 +78,8 @@ def test_html_sections_from_html_with_table_with_no_tbody():
 
 def test_that_items_are_ordered_in_chunked_document_for_filing():
     nvidia_10k_html = Path("data/Nvidia.10-K.html").read_text()
-    chunked_documents:ChunkedDocument = ChunkedDocument(nvidia_10k_html)
-    chunked_data=chunked_documents._chunked_data
+    chunked_documents: ChunkedDocument = ChunkedDocument(nvidia_10k_html)
+    chunked_data = chunked_documents._chunked_data
     # Test the repr
     repr_ = repr(chunked_documents)
     print()
@@ -105,7 +102,6 @@ def test_chunk_document_for_10k_amendment():
                     cik=1098009, accession_no='0001185185-23-001212')
 
     tenk = filing.obj()
-    from edgar.documents import HtmlDocument
     chunked_document: ChunkedDocument = tenk.doc
     item15 = chunked_document['Item 15']
     assert chunked_document.list_items() == ['Item 15']
@@ -116,6 +112,17 @@ def test_chunk_document_for_10k_amendment():
     assert chunked_document['Item 1'] is None
     assert chunked_document['Item 2'] is None
     assert chunked_document['Item 3'] is None
+
+
+def test_list_items_in_tenk():
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+    filing = Filing(company='Excelerate Energy, Inc.', cik=1888447, form='10-K', filing_date='2024-02-29',
+                    accession_no='0000950170-24-023104')
+    chunked_document: ChunkedDocument = ChunkedDocument(filing.html())
+    print(chunked_document.list_items())
+    assert chunked_document.list_items() == ['Item 1', 'Item 1A', 'Item 1B', 'Item 1C', 'Item 2', 'Item 3','Item 4',
+        'Item 5', 'Item 6', 'Item 7', 'Item 7A', 'Item 8', 'Item 9', 'Item 9A', 'Item 10','Item 11','Item 15', 'Item 16'
+    ]
 
 
 def test_detect_iems_for_eightk_with_bold_tags():
@@ -138,15 +145,13 @@ def test_filing_with_pdf_primary_document():
     assert html is None
 
 
-
 def test_html_text_works_with_no_failures():
     # This used to fail because of a bug in the html_to_text function
-    filing = Filing(form='10-K', filing_date='2024-01-31', company='ADVANCED MICRO DEVICES INC', cik=2488, accession_no='0000002488-24-000012')
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+    filing = Filing(form='10-K', filing_date='2024-01-31', company='ADVANCED MICRO DEVICES INC', cik=2488,
+                    accession_no='0000002488-24-000012')
     assert filing.text()
 
 
-def test_strip_xbrl_tags_from_filing_text():
-    filing = Filing(company='NexPoint Capital, Inc.', cik=1588272, form='8-K', filing_date='2023-12-20',
-                    accession_no='0001193125-23-300021')
-    text = filing.text()
-    print(text)
+
+

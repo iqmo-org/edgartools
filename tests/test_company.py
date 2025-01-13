@@ -1,16 +1,16 @@
-import json
 from functools import lru_cache
 from pathlib import Path
-import datetime
+
 import humanize
+import orjson as json
 import pyarrow.compute as pc
 from rich import print
 
-from edgar._companies import *
-from edgar._companies import (parse_entity_submissions, CompanyConcept, CompanyFiling, find_company,
-                              CompanySearchIndex, preprocess_company, _parse_cik_lookup_data)
 from edgar._filings import Filing, get_filings
 from edgar.core import default_page_size
+from edgar.entities import *
+from edgar.entities import (parse_entity_submissions, CompanyConcept, CompanyFiling, preprocess_company,
+                            _parse_cik_lookup_data)
 
 
 @lru_cache(maxsize=16)
@@ -36,7 +36,7 @@ def test_ticker_display_for_company_with_multiple_tickers():
 
 def test_parse_company_submission_json():
     with Path('data/company_submission.json').open("r") as f:
-        cjson = json.load(f)
+        cjson = json.loads(f.read())
     company = parse_entity_submissions(cjson)
     assert company.cik == 1318605
 
@@ -136,6 +136,15 @@ def test_company_filings_filter_by_date():
     filtered_filings = filings.filter(filing_date="2023-01-04:")
     assert not filtered_filings.empty
     assert len(filtered_filings) < len(expe.filings)
+
+
+def test_company_filter_with_no_results_returns_filings():
+    expe = get_test_company("EXPE")
+    filings = expe.filings.filter(form="NOTHING")
+    assert filings is not None
+    assert len(filings) == 0
+    latest = filings.latest()
+    assert not latest
 
 
 def test_company_get_filings_for_form():
@@ -264,7 +273,7 @@ def test_get_company_by_cik():
 
 
 def test_get_company_by_ticker():
-    company = get_entity("SNOW")
+    company = Company("SNOW")
     assert company.cik == 1640147
 
 
@@ -371,29 +380,6 @@ def test_filings_next_and_previous():
     print(eightk_filings.next())
 
 
-def test_search_for_company():
-    results = find_company('Robinsons')
-    print()
-    assert len(results) >= 10
-    print(results)
-    print(results[0])
-    assert results[0]
-
-
-def test_search():
-    is_start_of_quarter = datetime.datetime.now().month in [1, 4, 7, 10] and datetime.datetime.now().day <= 3
-    if is_start_of_quarter:
-        return
-    text_index = CompanySearchIndex(get_filings()
-                                    .to_pandas('company', 'cik'))
-    res = text_index.similar('Tesla')
-    assert not res.empty > 0
-    print()
-    print(res)
-    print(text_index.similar('Tensile'))
-    print(text_index.similar('Deniel Testa'))
-
-
 def test_preprocess_company():
     assert preprocess_company('Tesla Inc') == 'tesla'
     assert preprocess_company('Apple Hospitality REIT, Inc.') == 'apple hospitality reit'
@@ -416,7 +402,16 @@ def test_company_financials():
     company = Company('AAPL')
     financials = company.financials
     assert financials
-    assert financials.balance_sheet
+    assert financials.get_balance_sheet()
+    assert financials.get_income_statement()
+    assert financials.get_cash_flow_statement()
+    assert financials.get_statement_of_changes_in_equity()
+
+
+def test_company_with_no_latest_10k_has_no_financials():
+    company = Company('TD')
+    financials = company.financials
+    assert financials is None
 
 
 def test_iterate_company_filings():
@@ -434,3 +429,16 @@ def test_iterate_company_filings():
 
     for filing in filings:
         assert filing
+
+
+def test_company_to_dict():
+    company = Company(1012605)
+    company_dict = company.to_dict()
+    print(type(company_dict))
+    assert company_dict.get('cik') == 1012605
+    assert company_dict.get('name') == 'INTEGRINAUTICS'
+    assert company_dict.get('display_name') == 'Integrinautics'
+    assert 'filings' not in company_dict
+    print(company_dict)
+
+    assert 'filings' in company.to_dict(include_filings=True)

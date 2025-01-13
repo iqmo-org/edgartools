@@ -9,11 +9,11 @@ from rich.panel import Panel
 from rich.table import Table, Column
 from rich.text import Text
 
-from edgar._companies import Company
+from edgar.entities import Company
 from edgar._party import Address
 from edgar._party import Filer, Contact
-from edgar._rich import repr_rich
-from edgar._xml import child_text, child_texts
+from edgar.richtools import repr_rich
+from edgar.xmltools import child_text, child_texts
 
 __all__ = ['Form144',
            'concat_securities_information',

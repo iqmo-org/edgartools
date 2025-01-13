@@ -7,8 +7,9 @@ from bs4 import BeautifulSoup
 from rich.console import Group, Text
 from rich.markdown import Markdown
 
-from edgar._rich import df_to_rich_table, repr_rich
-from edgar.core import download_text, http_client, sec_dot_gov
+from edgar.richtools import df_to_rich_table, repr_rich
+from edgar.core import sec_dot_gov
+from edgar.httprequests import download_file
 
 __all__ = [
     'SecForms',
@@ -21,21 +22,23 @@ FUND_FORMS = ["NPORT-P", "NPORT-EX"]
 
 @lru_cache(maxsize=1)
 def list_forms():
-    forms_html = download_text('https://www.sec.gov/forms', http_client())
-    soup = BeautifulSoup(forms_html, features="lxml")
-    data_table = soup.find("table")
-    tbody = data_table.find("tbody")
-
     rows = []
-    for tr in tbody.find_all('tr'):
-        cells = tr.find_all('td')
-        rows.append({"Form": cells[0].text.replace("Number:", "").strip(),
-                     "Description": cells[1].text.replace("Description:", "").strip(),
-                     "Url": f"{sec_dot_gov}{cells[1].find('a').attrs['href']}" if cells[1].find('a') else "",
-                     "LastUpdated": cells[2].text.replace("Last Updated:", "").strip(),
-                     "SECNumber": cells[3].text.replace("SEC Number:", "").strip(),
-                     "Topics": cells[4].text.replace("Topic(s):", "").strip()
-                     })
+    for page in range(7):
+        forms_html = download_file(f'https://www.sec.gov/forms?page={page}')
+        soup = BeautifulSoup(forms_html, features="lxml")
+        data_table = soup.find("table")
+        tbody = data_table.find("tbody")
+
+        for tr in tbody.find_all('tr'):
+            cells = tr.find_all('td')
+            rows.append({"Form": cells[0].text.replace("Number:", "").strip(),
+                         "Description": cells[1].text.replace("Description:", "").strip(),
+                         "Url": f"{sec_dot_gov}{cells[1].find('a').attrs['href']}" if cells[1].find('a') else "",
+                         "LastUpdated": cells[2].text.replace("Last Updated:", "").strip(),
+                         "SECNumber": cells[3].text.replace("SEC Number:", "").strip(),
+                         "Topics": cells[4].text.replace("Topic(s):", "").strip()
+                         })
+            
     return SecForms(pd.DataFrame(rows))
 
 

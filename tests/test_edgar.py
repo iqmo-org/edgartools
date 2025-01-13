@@ -1,10 +1,15 @@
+import pytest
+
 from edgar import obj, matches_form, Filing, CurrentFilings, FundReport, find, get_current_filings, CompanySearchResults
-from edgar._companies import EntityData
-from edgar.ownership import Ownership
-from edgar.offerings import Offering
 from edgar.company_reports import TenK
 from edgar.effect import Effect
+from edgar.entities import EntityData
+from edgar.offerings import FormD
+from edgar.ownership import Ownership
+import httpx
 import pytest
+import edgar.httprequests
+from edgar import get_filings
 
 
 def test_matches_form():
@@ -51,7 +56,7 @@ def test_obj():
                     cik=1965493,
                     accession_no='0001965493-23-000001')
     offering = obj(filing)
-    assert isinstance(offering, Offering)
+    assert isinstance(offering, FormD)
 
     # 10-K filing
     filing_10k = Filing(form='10-K',
@@ -65,7 +70,7 @@ def test_obj():
     tenk = filing_10k.data_object()
     assert isinstance(tenk, TenK)
 
-    assert tenk.cash_flow_statement.end_date == '2022-12-31'
+    assert ['2022', '2021', '2020'] == tenk.cash_flow_statement.periods
 
     filing = Filing(form='1-A/A', filing_date='2023-03-21', company='CancerVAX, Inc.', cik=1905495,
                     accession_no='0001493152-23-008348')
@@ -79,8 +84,13 @@ def test_find():
     assert isinstance(find("CancerVAX, Inc."), CompanySearchResults)
 
 
+def test_find_a_dot_ticker():
+    assert find("BRK.B").cik == 1067983
+    assert find("CRD-A").cik == 25475
+
+
 def test_find_a_current_filing():
-    filings:CurrentFilings = get_current_filings().next()
+    filings: CurrentFilings = get_current_filings().next()
     accession_number = filings.data['accession_number'].to_pylist()[0]
     filing = find(accession_number)
     assert filing

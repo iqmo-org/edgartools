@@ -1,17 +1,25 @@
-from pathlib import Path
-from rich import print
-import pandas as pd
 import re
-from bs4 import BeautifulSoup
-from edgar.documents import *
 from copy import copy
+from pathlib import Path
+
+import pandas as pd
+from bs4 import BeautifulSoup
+from rich import print
+
 from edgar import Filing
-from edgar.htmltools import ChunkedDocument
+from edgar.datatools import dataframe_to_text
+from edgar.files.html_documents import *
+from edgar.files.html_documents import fixup
+from edgar.files.htmltools import ChunkedDocument
+from typing import Optional
 
 pd.options.display.max_columns = 10
+import warnings
+warnings.filterwarnings("ignore")
 
 
 def test_html_document_does_not_drop_content():
+    warnings.filterwarnings("ignore")
     html_str = Path("data/ixbrl.simple.html").read_text()
     document = HtmlDocument.from_html(html_str)
 
@@ -23,7 +31,7 @@ def test_html_document_does_not_drop_content():
 
 
 def test_html_document_data():
-    document: HtmlDocument = HtmlDocument.from_html(Path("data/ixbrl.simple.html").read_text())
+    document: HtmlDocument = HtmlDocument.from_html(Path("data/ixbrl.simple.html").read_text(), extract_data=True)
     document_ixbrl: DocumentData = document.data
     assert "NamedExecutiveOfficersFnTextBlock" in document_ixbrl
     assert 'PeoName' in document_ixbrl
@@ -99,7 +107,7 @@ def test_parse_complicated_htmldocument():
 
     assert "NVIDIA has a platform strategy" in html_document.text
 
-    doc:ChunkedDocument = ChunkedDocument(html_str)
+    doc: ChunkedDocument = ChunkedDocument(html_str)
     assert "are not a part of this Annual Report on Form 10-K" in doc['Item 1']
     assert "evaluating NVIDIA, the following risk factors should be considered" in doc['Item 1A']
     assert "Microsoft may have first and last rights of refusal to purchase the stock" in doc['Item 1A']
@@ -108,11 +116,13 @@ def test_parse_complicated_htmldocument():
     assert "stock is traded on the Nasdaq Global Select Market under the symbol NVDA" in doc['Item 5']
     assert "The following discussion and analysis of our financial condition and results of operations" in doc["Item 7"]
     assert "Climate Change" in doc["Item 7"]
-    assert "The information required by this Item is set forth in our Consolidated Financial Statements" in doc['Item 8']
+    assert "The information required by this Item is set forth in our Consolidated Financial Statements" in doc[
+        'Item 8']
     assert "None" in doc['Item 9']
     assert "Based on their evaluation as of January 29, 2023, our management" in doc['Item 9A']
     assert "all control issues and instances of fraud, if any, within NVIDIA have been detected" in doc['Item 9A']
     assert "Equity Compensation Plan Information" in doc["Item 12"]
+
 
 def test_htmldocument_from_filing_with_document_tag():
     """
@@ -131,6 +141,7 @@ def test_htmldocument_from_filing_with_document_tag():
 def test_parse_ixbrldocument_with_nested_div_tags():
     text = Path("data/NextPoint.8K.html").read_text()
     document: HtmlDocument = HtmlDocument.from_html(text)
+    print(document.text)
     # The html
     assert "5.22" in document.text
     assert "at $5.22 per share" in document.text
@@ -144,6 +155,8 @@ def test_eightk_item_parsing_after_dollar_sign():
                     accession_no='0001193125-23-300021')
     document: HtmlDocument = HtmlDocument.from_html(filing.html())
     assert "(the “DRP”) at $5.22 per share" in document.text
+    assert "(the “DRP”) at $5.22 per share" in document.markdown
+    print(document.markdown)
 
 
 def test_parse_inline_divs_with_ixbrl_tags():
@@ -164,6 +177,7 @@ def test_parse_inline_divs_with_ixbrl_tags():
 
 def test_parse_ixbrldocument_with_dimensions():
     text = Path("data/cabot.DEF14A.ixbrl.html").read_text()
+    warnings.filterwarnings("ignore")
     headers = BeautifulSoup(text, 'lxml').find_all('ix:header')
     document: DocumentData = DocumentData.parse_headers(headers)
     assert document
@@ -451,3 +465,178 @@ def test_get_clean_html():
     html = get_clean_html(html)
     assert not "<ix:header>" in html
     assert not '<!-- This is a header -->' in html
+
+
+def test_get_text_for_paper_filing():
+    filing = Filing(form='FOCUSN', filing_date='2024-02-28', company='JACKSON NATIONAL LIFE DISTRIBUTORS LLC',
+                    cik=1006323, accession_no='9999999997-24-001009')
+
+    text = filing.text()
+    assert text
+
+
+def test_get_table_blocks():
+        html = """
+        <html>
+        
+        <body>
+        <table>
+        <thead>
+            <tr><th>#</th><th>Count</th></tr>
+        </thead>
+        <tbody>
+            <tr>1<td></td><td>400</td></tr>
+            <tr>2<td></td><td>900</td></tr>
+        </tbody>
+        </table>
+        </body>
+        </html>
+        """
+        document = HtmlDocument.from_html(html)
+        tables = document.get_table_blocks()
+        assert len(tables) == 1
+
+
+def test_table_to_text():
+    html = """
+    <table cellpadding="0" cellspacing="0" style="border-collapse: collapse; width: 100%; font: 10pt Times New Roman, Times, Serif">
+<tr style="vertical-align: bottom; background-color: White">
+<td style="padding-bottom: 1.5pt"> </td><td style="font-weight: bold; padding-bottom: 1.5pt"> </td>
+<td style="border-bottom: Black 1.5pt solid; font-weight: bold; text-align: left"> </td><td style="border-bottom: Black 1.5pt solid; font-weight: bold; text-align: center"><font style="font-family: Times New Roman, Times, Serif; font-size: 10pt"><b>Per
+                                         Share</b></font></td><td style="padding-bottom: 1.5pt; font-weight: bold; text-align: left"> </td><td style="font-weight: bold; padding-bottom: 1.5pt"> </td>
+<td style="border-bottom: Black 1.5pt solid; font-weight: bold; text-align: left"> </td><td style="border-bottom: Black 1.5pt solid; font-weight: bold; text-align: center"><font style="font-family: Times New Roman, Times, Serif; font-size: 10pt"><b>Total</b></font></td><td style="padding-bottom: 1.5pt; font-weight: bold; text-align: left"> </td></tr>
+<tr>
+<td> </td>
+<td>$</td><td style="width: 12%; text-align: right">14.50</td><td style="width: 1%; text-align: left"> </td><td style="width: 2%"> </td>
+<td>$</td><td style="width: 12%; text-align: right">95,700,000</td><td style="width: 1%; text-align: left"> </td></tr>
+<tr>
+<td>Underwriting discounts and commissions (1)</td><td> </td>
+<td>$</td><td style="text-align: right">0.87</td><td style="text-align: left"> </td><td> </td>
+<td>$</td><td style="text-align: right">5,742,000</td><td style="text-align: left"> </td></tr>
+<tr>
+<td>Proceeds to us, before expenses</td><td> </td>
+<td>$</td><td style="text-align: right">13.63</td><td style="text-align: left"> </td><td> </td>
+<td>$</td><td style="text-align: right">89,958,000</td><td style="text-align: left"> </td></tr>
+</table>
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    table = soup.find('table')
+    text = table_to_text(table)
+    print(text)
+    assert text.count('\n') == 5
+    fixed = fixup(text)
+    assert fixed.count('\n') == 5
+    print(fixed)
+
+
+def test_table_block_to_dataframe():
+    html = """
+    <table>
+<tr>
+<td><b>SVB
+    Leerink</b></font></td>
+<td><font><b>Cantor</b></font></td></tr>
+</table>
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    table = soup.find('table')
+    table_block = TableBlock(table)
+    df = table_block.to_dataframe()
+    assert df.shape == (1, 2)
+
+
+def test_get_table_containing_text():
+    filing = Filing(form='424B5', filing_date='2020-06-18', company='Provention Bio, Inc.', cik=1695357, accession_no='0001493152-20-011383')
+    document:HtmlDocument = HtmlDocument.from_html(filing.html())
+    blocks = document.get_table_blocks()
+    print()
+    table_blocks = [block for block in blocks if 'Number of' in block.get_text()]
+    for block in table_blocks:
+        table = block.to_dataframe()
+        if not table.empty:
+            print(dataframe_to_text(table))
+
+
+def test_html_to_text():
+    html = Path('data/NextPoint.8K.html').read_text()
+    text = html_to_text(html)
+    assert text
+    assert 'NEXPOINT CAPITAL' in text
+    print(text)
+
+
+def test_document_get_text():
+    """Render text from a document"""
+    filing = Filing(company='Paramount Global', cik=813828, form='8-K', filing_date='2024-04-29',
+                    accession_no='0000813828-24-000018')
+    document:HtmlDocument = HtmlDocument.from_html(filing.attachments[1].download())
+    text = document.text
+    assert "A Quiet Place, Mission Impossible, Scream, Teenage Mutant Ninja Turtles and PAW Patrol" in text
+    print(text)
+
+
+def test_document_get_markdown():
+    """Render mark from a document"""
+    filing = Filing(company='Paramount Global', cik=813828, form='8-K', filing_date='2024-04-29',
+                    accession_no='0000813828-24-000018')
+    """ """
+    document:HtmlDocument = HtmlDocument.from_html(filing.attachments[1].download())
+    md = document.markdown
+    assert md
+    assert "A Quiet Place, Mission Impossible, Scream, Teenage Mutant Ninja Turtles and PAW Patrol" in md
+    assert "Leading Paramount’s Business Units" in md
+
+
+def test_filing_text_for_file_with_fil_extension():
+    filing = Filing(form='NSAR-A', filing_date='2016-06-28',
+                    company='AMERICAN FUNDS GLOBAL BALANCED FUND', cik=1505612, accession_no='0000051931-16-002553')
+    assert "American Funds Global Balanced Fund" in filing.html()
+    assert "American Funds Global Balanced Fund" in filing.text()
+    assert "American Funds Global Balanced Fund" in filing.markdown()
+
+    filing = Filing(form='NSAR-A', filing_date='2016-09-28', company='Investment Managers Series Trust', cik=1318342,
+                    accession_no='0000926877-16-000629')
+    assert "A000000 INVESTMENT MANAGERS SERIES TRUST" in filing.html()
+    assert "A000000 INVESTMENT MANAGERS SERIES TRUST" in filing.text()
+
+
+def test_parse_html_with_funny_character():
+    # repr was not implemented on Table Block so there was an exception
+    filing = Filing(company='WideOpenWest, Inc.', cik=1701051, form='10-K', filing_date='2024-03-13', accession_no='0001558370-24-003047')
+    tenk = filing.obj()
+    chunked_document:ChunkedDocument = tenk.chunked_document
+
+    item_1a_chunks = list(chunked_document.chunks_for_item("Item 1A"))
+    blocks = item_1a_chunks[6]
+    result = repr(blocks[0])
+    assert result
+
+def test_get_clean_html_from_unusual_filing():
+    filing =  Filing(form='NSAR-B', filing_date='2016-12-29', company='Thrivent Cash Management Trust', cik=1300087,
+                     accession_no='0001193125-16-805810')
+    html = filing.html()
+    clean_html = get_clean_html(html)
+    assert not clean_html
+    markdown = filing.markdown()
+    assert markdown
+
+
+def test_get_text_from_prospectus():
+    #Expected xmlns:xbrli for the instance namespace
+    # but was xmlns:i="http://www.xbrl.org/2003/instance" xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+    filing = Filing(form='485BPOS', filing_date='2024-03-28', company='DELAWARE GROUP EQUITY FUNDS II', cik=27574, accession_no='0001145443-24-000056')
+    text = filing.text()
+    assert text
+    #print(text)
+    html_document:Optional[HtmlDocument] = HtmlDocument.from_html(filing.html(), extract_data=True)
+    assert html_document.data
+
+
+def test_parse_html_document_with_issue_decomposing_page_numbers():
+    filing = Filing(form='10-Q', filing_date='2024-07-16', company='Global Arena Holding, Inc.', cik=1138724,
+           accession_no='0001756125-24-001116')
+    text = filing.text()
+    assert text
+
+
+

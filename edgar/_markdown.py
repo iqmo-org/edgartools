@@ -5,15 +5,17 @@ from rich.console import Group, Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
-from edgar.documents import get_clean_html
-from edgar._rich import repr_rich
+
+from edgar.richtools import repr_rich
+from edgar.files.html_documents import HtmlDocument
 
 __all__ = [
     'convert_table',
     'MarkdownContent',
     'markdown_to_rich',
     'html_to_markdown',
-    "fix_markdown"
+    "fix_markdown",
+    "text_to_markdown",
 ]
 
 
@@ -88,25 +90,38 @@ def fix_markdown(md: str):
 
 
 def html_to_markdown(html: str) -> str:
-    from markdownify import markdownify
-    return fix_markdown(markdownify(html))
+    """Convert the html to markdown"""
+    document: HtmlDocument = HtmlDocument.from_html(html)
+    return document.markdown
+
+
+def text_to_markdown(text: str) -> str:
+    """Convert the text to markdown"""
+    return f"""
+    <pre>{text}</pre>
+    """
 
 
 class MarkdownContent:
 
     def __init__(self,
-                 html: str,
+                 markdown: str,
                  title: str = ""):
-        html = get_clean_html(html)
-        self.md = html_to_markdown(html)
+        self.md = markdown
         self.title = title
+
+    @classmethod
+    def from_html(cls, html: str, title: str = ""):
+        md = html_to_markdown(html)
+        return cls(markdown=md, title=title)
 
     def view(self):
         console = Console()
         console.print(self.__rich__())
 
     def __rich__(self):
-        return markdown_to_rich(self.md, title=self.title)
+        _renderable = markdown_to_rich(self.md, title=self.title)
+        return _renderable
 
     def __repr__(self):
         return repr_rich(self.__rich__())

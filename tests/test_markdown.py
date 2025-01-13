@@ -1,8 +1,10 @@
 from pathlib import Path
-
+from edgar import Filing, Document
 from rich import print
+from rich.panel import Panel
 
-from edgar._markdown import convert_table, MarkdownContent, fix_markdown
+from edgar._markdown import convert_table, MarkdownContent, fix_markdown, markdown_to_rich
+from edgar.datatools import markdown_to_dataframe
 
 
 def test_convert_markdown_table():
@@ -26,18 +28,19 @@ def test_convert_empty_table():
     print(convert_table(markdown_str))
 
 
-def test_form4_to_markdown():
-    html = Path('data/form4.Evans.html').read_text()
-    markdown_content = MarkdownContent(html)
+def test_markdown_to_rich_for_plain_text():
+    md = """
+    <pre>This is a test of the markdown to rich conversion</pre>
+    """
     print()
-    print(markdown_content)
-    assert markdown_content
-    assert "SULLIVAN NORA" in repr(markdown_content)
+    renderable = markdown_to_rich(md)
+    assert isinstance(renderable, Panel)
+    print(renderable)
 
 
 def test_markdown_to_html():
     html = Path('data/form.6k.Athena.html').read_text()
-    markdown_content = MarkdownContent(html)
+    markdown_content = MarkdownContent.from_html(html)
     print()
     text = repr(markdown_content)
     print(text)
@@ -46,7 +49,7 @@ def test_markdown_to_html():
 
 def test_markdown_content_html_with_no_tables():
     html = Path('data/form6k.RoyalPhilips.html').read_text()
-    markdown_content = MarkdownContent(html)
+    markdown_content = MarkdownContent.from_html(html)
     print()
     text = repr(markdown_content)
     assert text
@@ -71,7 +74,6 @@ def test_fix_markdown():
     md = "ITEM\n1 - BUSINESS"
     assert "ITEM 1 - BUSINESS" in fix_markdown(md)
 
-
     # Cleanup Item\xa01
     md = fix_markdown("Item\xa01")
     assert "Item 1" in md
@@ -90,7 +92,7 @@ def test_fix_markdown():
     """
     assert ". Item 9.01" in md
     md_fixed = fix_markdown(md)
-    assert ".\n Item 9.01" in md_fixed
+    assert any(line.startswith(" Item 9.01") for line in md_fixed.splitlines())
 
     # Fix no spaces before Item
     md = """
@@ -99,22 +101,59 @@ def test_fix_markdown():
     Discussion and Analysis of Financial Condition and Results of 
     """
     md_fixed = fix_markdown(md)
-    assert " Item 7" in md_fixed
+    assert any(line.startswith(" Item 7") for line in md_fixed.splitlines())
 
 
-def test_that_markdown_has_proper_line_breaks():
-    from edgar import Filing
-    from markdownify import markdownify
-    import re
-    filing = Filing(form='10-K', filing_date='2023-09-21', company='CAMPBELL SOUP CO', cik=16732,
-           accession_no='0000016732-23-000109')
-    print()
-    print(filing.markdown())
-    #print(markdownify(filing.html()))
+def test_markdown_to_dataframe():
+    "Create a markdown table so we can test converting to a dataframe"
+    markdown_table = """
+    | Title of each class | Trading Symbol(s) | Exchange | 
+    | --- | --- | --- | 
+    | Common Shares       | EFSH              | NYSE American LLC |
+    """.strip()
+    df = markdown_to_dataframe(markdown_table)
+    assert df.shape == (1, 3)
+
+
+def test_dataframe_from_markdown_is_compressed():
+    markdown_table = """
+    | Name |     |City     | Exchange | 
+    | ---- | --- | ------- | -------- | 
+    | Mike |     |Boston   | X        | 
+    |      |     |         |         | 
+    | Kyra |     |New York | X        | 
+    """.strip()
+    df = markdown_to_dataframe(markdown_table)
+    assert df.shape == (2, 3)
+
+
+def test_dataframe_from_markdown_for_header_only_table():
+    markdown_table = """
+    | Name |     |City     | Exchange | 
+    | ---- | --- | ------- | -------- | 
+    """.strip()
+    df = markdown_to_dataframe(markdown_table)
+    assert df.shape == (1, 3)
+
+def test_markdown_to_dataframe_for_header_only_table():
     md = """
-    Repurchases under the September 2021 program may be made in open-market or 
-privately negotiated transactions.Item 6. ReservedItem 7. Management's 
-Discussion and Analysis of Financial Condition and Results of 
-"""
-    #md = re.sub(r"(\S)(Item)\s?(\d.\d{,2})", r"\1\n \2 \3", md)
-    #print(md)
+    | SVB Leerink | Cantor |
+    |-------------|--------|
+    """.strip()
+    df = markdown_to_dataframe(md)
+    assert df.shape == (1, 2)
+
+def test_markdown_text_has_correct_spaces():
+
+    filing = Filing(company='Paramount Global', cik=813828, form='8-K', filing_date='2024-04-29',
+                    accession_no='0000813828-24-000018')
+
+    md = filing.markdown()
+    print(md)
+
+
+def test_obscure_filing_to_markdown():
+    filing = Filing(form='TA-1/A', filing_date='2024-03-13', company='DB SERVICES AMERICAS INC /TA', cik=1018490, accession_no='0001018490-24-000008')
+    html = filing.html()
+    md = filing.markdown()
+    assert not md

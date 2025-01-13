@@ -13,10 +13,11 @@ from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table, Column
 
-from edgar._companies import Company
-from edgar._filings import SECHeader, Filings
-from edgar._rich import repr_rich, df_to_rich_table
-from edgar.core import download_text, log
+from edgar.entities import Company
+from edgar._filings import FilingHeader, Filings
+from edgar.richtools import repr_rich, df_to_rich_table
+from edgar.core import log
+from edgar.httprequests import download_text
 
 __all__ = [
     'Fund',
@@ -40,7 +41,6 @@ fund_series_search_url = "https://www.sec.gov/cgi-bin/series?company="
 fund_class_or_series_search_url = "https://www.sec.gov/cgi-bin/browse-edgar?CIK={}"
 
 
-
 class Fund(BaseModel):
     """This actually represents a fund contract"""
     company_cik: str
@@ -57,7 +57,7 @@ class Fund(BaseModel):
     @property
     @lru_cache(maxsize=1)
     def filings(self):
-        fund_class:FundClass = get_fund_with_filings(self.class_contract_id)
+        fund_class: FundClass = get_fund_with_filings(self.class_contract_id)
         return fund_class.filings
 
     def __hash__(self):
@@ -77,7 +77,6 @@ class Fund(BaseModel):
 
     def __repr__(self):
         return repr_rich(self.__rich__())
-
 
 
 @lru_cache(maxsize=16)
@@ -171,7 +170,7 @@ class FundCompanyInfo:
         return self.ident_info.get("State of Inc.", None)
 
     @lru_cache(maxsize=1)
-    def id_and_name(self, contract_or_series:str) -> Optional[Tuple[str, str]]:
+    def id_and_name(self, contract_or_series: str) -> Optional[Tuple[str, str]]:
         class_contract_str = self.ident_info.get(contract_or_series, None)
         if not class_contract_str:
             return None
@@ -376,7 +375,7 @@ def get_fund_with_filings(contract_or_series_id: str):
        to get the fund class or series including the filings
 
     """
-    if not re.match("[CS]\d+", contract_or_series_id):
+    if not re.match(r"[CS]\d+", contract_or_series_id):
         return None
     search_url = fund_class_or_series_search_url.format(contract_or_series_id)
 
@@ -406,7 +405,7 @@ class FundSeriesAndContracts:
         return repr_rich(self.__rich__())
 
 
-def get_fund_information(sec_header: SECHeader):
+def get_fund_information(sec_header: FilingHeader):
     header_text = sec_header.text
     series_and_classes_contracts_text = re.search(
         r'<SERIES-AND-CLASSES-CONTRACTS-DATA>(.*?)</SERIES-AND-CLASSES-CONTRACTS-DATA>', header_text, re.DOTALL)

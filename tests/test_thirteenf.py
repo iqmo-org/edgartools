@@ -5,7 +5,7 @@ from edgar import *
 
 
 def test_parse_infotable():
-    infotable = ThirteenF.parse_infotable_xml(Path("data/13F-HR.infotable.xml").read_text())
+    infotable = ThirteenF.parse_infotable_xml(Path("data/xml/13F-HR.infotable.xml").read_text())
     assert len(infotable) == 255
 
 
@@ -48,8 +48,6 @@ def test_thirteenf_from_filing_with_multiple_related_filing_on_same_day():
     assert not thirteenF.infotable_html
     assert not thirteenF.infotable
 
-    print(thirteenF)
-
     # Should throw an AssertionError if you try to parse a 10-K as a 13F
     filing = Filing(form='10-K', filing_date='2023-03-23', company='ADMA BIOLOGICS, INC.', cik=1368514,
                     accession_no='0001140361-23-013467')
@@ -70,7 +68,7 @@ def test_thirteenf_multiple_related_filings_dont_use_latest_period_of_report():
     assert thirteenF.has_infotable()
     assert len(thirteenF.infotable) == 6
     assert thirteenF.report_period == '2021-12-31'
-    assert thirteenF.filing.header.period_of_report == '20211231'
+    assert thirteenF.filing.header.period_of_report == '2021-12-31'
     # The filing is whatever was passed in
     assert thirteenF.filing.accession_no == '0001140361-23-013281' == thirteenF.accession_number
 
@@ -78,8 +76,8 @@ def test_thirteenf_multiple_related_filings_dont_use_latest_period_of_report():
     related_filings = filing.related_filings()
     first_period = related_filings[0].header.period_of_report
     last_period = related_filings[-1].header.period_of_report
-    assert first_period == '20171231'
-    assert last_period >= '20230930'
+    assert first_period == '2017-12-31'
+    assert last_period >= '2023-09-30'
 
 
 def test_thirteenf_holdings():
@@ -156,9 +154,9 @@ def test_thirteenf_with_broken_infotable_xml():
     <directory>
     <name>/Archives/edgar/data</name>
     <item>
-    <name type="text.gif">0001894188-23-000007-index-headers.html</name>
+    <name type="text.gif">0001894188-23-000007-23AndMe.index-headers.html</name>
     <size></size>
-    <href>/Archives/edgar/data/1894188/000189418823000007/0001894188-23-000007-index-headers.html</href>
+    <href>/Archives/edgar/data/1894188/000189418823000007/0001894188-23-000007-23AndMe.index-headers.html</href>
     <last-modified>2023-11-14 09:38:54</last-modified>
     </item>
     :return:
@@ -197,3 +195,11 @@ def test_13FNT_other_included_managers():
     assert thirteenf.primary_form_information.summary_page.other_included_managers_count == 0
     assert thirteenf.primary_form_information.summary_page.total_holdings == 0
     assert thirteenf.primary_form_information.summary_page.total_value == 0
+
+
+def test_thirteenf_put_call():
+    filing = Filing(form='13F-HR/A', filing_date='2024-06-07', company='SG Capital Management LLC', cik=1510099, accession_no='0001172661-24-002551')
+    thirteenf:ThirteenF = ThirteenF(filing)
+    puts = thirteenf.infotable.query("PutCall == 'Put'")
+    assert len(puts) == 3
+    print(thirteenf)

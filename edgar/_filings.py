@@ -1,25 +1,27 @@
 import itertools
-import os.path
+import pickle
 import re
 import webbrowser
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
-from functools import lru_cache
+from functools import lru_cache, cached_property
 from io import BytesIO
-from typing import Tuple, List, Dict, Union, Optional
+from os import PathLike
+from pathlib import Path
+from typing import Tuple, List, Dict, Union, Optional, Any, cast
 
 import httpx
 import numpy as np
+import orjson as json
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
-import pytz
+
 from bs4 import BeautifulSoup
-from fastcore.basics import listify
 from fastcore.parallel import parallel
-from retry.api import retry_call
 from rich import box
 from rich.columns import Columns
 from rich.console import Group
@@ -28,18 +30,45 @@ from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 
-from edgar._markdown import MarkdownContent
-from edgar._markdown import html_to_markdown
+from edgar._markdown import text_to_markdown
 from edgar._party import Address
-from edgar._rich import df_to_rich_table, repr_rich
-from edgar._xbrl import FilingXbrl
-from edgar._xml import child_text
-from edgar.core import (http_client, download_text, download_file, log, display_size, sec_edgar, get_text_between_tags,
-                        filter_by_date, filter_by_form, sec_dot_gov, InvalidDateException, IntString, DataPager,
-                        text_extensions, binary_extensions, datefmt, reverse_name)
-from edgar.documents import HtmlDocument, get_clean_html
-from edgar.htmltools import html_sections
+from edgar.attachments import FilingHomepage, Attachment, Attachments, AttachmentServer
+from edgar.core import (log, display_size, sec_edgar,
+                        filter_by_date,
+                        filter_by_form,
+                        filter_by_cik,
+                        filter_by_ticker,
+                        filter_by_accession_number,
+                        listify,
+                        cache_except_none,
+                        is_start_of_quarter,
+                        has_html_content,
+                        InvalidDateException,
+                        IntString,
+                        current_year_and_quarter,
+                        Years,
+                        Quarters,
+                        YearAndQuarter,
+                        YearAndQuarters,
+                        quarters_in_year,
+                        filing_date_to_year_quarters,
+                        DataPager)
+from edgar.files.html import Document
+
+from edgar.files.html_documents import get_clean_html
+from edgar.files.htmltools import html_sections
+from edgar.files.markdown import to_markdown
+from edgar.filingheader import FilingHeader
+from edgar.headers import FilingDirectory, IndexHeaders
+from edgar.httprequests import download_file, download_text, download_text_between_tags
+from edgar.httprequests import get_with_retry
+from edgar.reference import describe_form
+from edgar.richtools import repr_rich, rich_to_text, print_rich
 from edgar.search import BM25Search, RegexSearch
+from edgar.xbrl import XBRLData, XBRLInstance, get_xbrl_object
+from edgar.xmltools import child_text
+from edgar.sgml import FilingSgml
+from edgar.reference.tickers import find_ticker
 
 """ Contain functionality for working with SEC filing indexes and filings
 
@@ -53,8 +82,7 @@ __all__ = [
     'Filing',
     'Filings',
     'get_filings',
-    'FilingXbrl',
-    'SECHeader',
+    'FilingHeader',
     'FilingsState',
     'Attachment',
     'Attachments',
@@ -62,15 +90,14 @@ __all__ = [
     'CurrentFilings',
     'available_quarters',
     'get_current_filings',
-    'get_by_accession_number'
+    'get_by_accession_number',
+    'filing_date_to_year_quarters'
 ]
 
 full_index_url = "https://www.sec.gov/Archives/edgar/full-index/{}/QTR{}/{}.{}"
 daily_index_url = "https://www.sec.gov/Archives/edgar/daily-index/{}/QTR{}/{}.{}.idx"
 
 filing_homepage_url_re = re.compile(f"{sec_edgar}/data/[0-9]{1,}/[0-9]{10}-[0-9]{2}-[0-9]{4}-index.html")
-
-headers = {'User-Agent': 'Dwight Gunning dgunning@gmail.com'}
 
 full_or_daily = ['daily', 'full']
 index_types = ['form', 'company', 'xbrl']
@@ -81,29 +108,45 @@ xbrl_index = "xbrl"
 company_index = "company"
 
 max_concurrent_http_connections = 10
-quarters_in_year: List[int] = list(range(1, 5))
 
-YearAndQuarter = Tuple[int, int]
-YearAndQuarters = List[YearAndQuarter]
-Years = Union[int, List[int], range]
-Quarters = Union[int, List[int], range]
 
 accession_number_re = re.compile(r"\d{10}-\d{2}-\d{6}$")
 
 xbrl_document_types = ['XBRL INSTANCE DOCUMENT', 'XBRL INSTANCE FILE', 'EXTRACTED XBRL INSTANCE DOCUMENT']
 
 
-def current_year_and_quarter() -> Tuple[int, int]:
-    # Define the Eastern timezone
-    eastern = pytz.timezone('America/New_York')
 
-    # Get the current time in Eastern timezone
-    now_eastern = datetime.now(eastern)
 
-    # Calculate the current year and quarter
-    current_year, current_quarter = now_eastern.year, (now_eastern.month - 1) // 3 + 1
 
-    return current_year, current_quarter
+def is_valid_filing_date(filing_date: str) -> bool:
+    if ":" in filing_date:
+        # Check for only one colon
+        if filing_date.count(":") > 1:
+            return False
+        start_date, end_date = filing_date.split(":")
+        if start_date:
+            if not is_valid_date(start_date):
+                return False
+        if end_date:
+            if not is_valid_date(end_date):
+                return False
+    else:
+        if not is_valid_date(filing_date):
+            return False
+
+    return True
+
+
+def is_valid_date(date_str: str, date_format: str = "%Y-%m-%d") -> bool:
+    pattern = r"^\d{4}-\d{2}-\d{2}$"
+    if not re.match(pattern, date_str):
+        return False
+
+    try:
+        datetime.strptime(date_str, date_format)
+        return True
+    except ValueError:
+        return False
 
 
 def get_previous_quarter(year, quarter) -> Tuple[int, int]:
@@ -127,8 +170,8 @@ def available_quarters() -> YearAndQuarters:
     return start_quarters + in_between_quarters + end_quarters
 
 
-def expand_quarters(year: Years,
-                    quarter: int = None) -> YearAndQuarters:
+def expand_quarters(year: Union[int, List[int]],
+                    quarter: Optional[Union[int, List[int]]] = None) -> YearAndQuarters:
     """
     Expand the list of years and a list of quarters to a full list of tuples covering the full range
     :param year: The year or years
@@ -141,6 +184,9 @@ def expand_quarters(year: Years,
             for yq in itertools.product(years, quarters)
             if yq in available_quarters()
             ]
+
+
+
 
 
 class FileSpecs:
@@ -179,6 +225,9 @@ company_specs = FileSpecs(
      ]
 )
 
+FORM_INDEX_COLUMNS = ['form', 'company', 'cik', 'filing_date', 'accession_number']
+COMPANY_INDEX_COLUMNS = ['company', 'form', 'cik', 'filing_date', 'accession_number']
+
 
 def read_fixed_width_index(index_text: str,
                            file_specs: FileSpecs) -> pa.Table:
@@ -215,7 +264,7 @@ def read_fixed_width_index(index_text: str,
     date_format = '%Y-%m-%d' if len(arrays[3][0].as_py()) == 10 else '%Y%m%d'
     arrays[3] = pc.cast(pc.strptime(arrays[3], date_format, 'us'), pa.date32())
 
-    # Get the accession number from the file path
+    # Get the accession number from the file directory_or_file
     arrays[4] = pa.compute.utf8_slice_codeunits(
         pa.compute.utf8_rtrim(arrays[4], characters=".txt"), start=-20)
 
@@ -223,6 +272,54 @@ def read_fixed_width_index(index_text: str,
         arrays=arrays,
         names=list(file_specs.schema.names),
     )
+
+
+def read_index_file(index_text: str, columns:List[str] = FORM_INDEX_COLUMNS) -> pa.Table:
+    """
+    Read the index text using multiple spaces as delimiter
+    """
+    # Split into lines and find the data start
+    lines = index_text.rstrip('\n').split('\n')
+    data_start = 0
+    for index, line in enumerate(lines):
+        if line.startswith("-----"):
+            data_start = index + 1
+            break
+
+    # Process data lines
+    data_lines = lines[data_start:]
+
+    # Split each line by 2 or more spaces
+    rows = [line.split() for line in data_lines if line.strip()]
+
+    # Convert to arrays
+    forms = pa.array([line[:12].strip() for line in data_lines]) # The form might contain spaces like '1-A POS'
+
+    # Company names may have single spaces within them
+    companies = pa.array([' '.join(row[1:-3]) for row in rows])
+
+    # CIKs are always the third-to-last field
+    ciks = pa.array([int(row[-3]) for row in rows], type=pa.int32())
+
+    # Dates are always second-to-last field
+    dates = pc.strptime(pa.array([row[-2] for row in rows]), '%Y-%m-%d', 'us')
+    dates = pc.cast(dates, pa.date32())
+
+    # Accession numbers are in the file path
+    accession_numbers = pa.array([row[-1][-24:-4] for row in rows])
+
+    return pa.Table.from_arrays(
+        [forms, companies, ciks, dates, accession_numbers],
+        names=columns
+    )
+
+def read_form_index_file(index_text: str) -> pa.Table:
+    """Read the form index file"""
+    return read_index_file(index_text, columns=FORM_INDEX_COLUMNS)
+
+def read_company_index_file(index_text: str) -> pa.Table:
+    """Read the company index file"""
+    return read_index_file(index_text, columns=COMPANY_INDEX_COLUMNS)
 
 
 def read_pipe_delimited_index(index_text: str) -> pa.Table:
@@ -248,37 +345,40 @@ def read_pipe_delimited_index(index_text: str) -> pa.Table:
 
 
 def fetch_filing_index(year_and_quarter: YearAndQuarter,
-                       client: Union[httpx.Client, httpx.AsyncClient],
                        index: str
                        ):
     year, quarter = year_and_quarter
     url = full_index_url.format(year, quarter, index, "gz")
-    index_table = fetch_filing_index_at_url(url, client, index)
-    return (year, quarter), index_table
+    try:
+        index_table = fetch_filing_index_at_url(url, index)
+        return (year, quarter), index_table
+    except httpx.HTTPStatusError as e:
+        if is_start_of_quarter() and e.response.status_code == 403:
+            # Return an empty filing index
+            return (year, quarter), _empty_filing_index()
+        else:
+            raise
 
 
 def fetch_daily_filing_index(date: str,
-                             client: Union[httpx.Client, httpx.AsyncClient] = None,
                              index: str = 'form'):
     year, month, day = date.split("-")
     quarter = (int(month) - 1) // 3 + 1
     url = daily_index_url.format(year, quarter, index, date.replace("-", ""))
-    client = client or http_client()
-    index_table = fetch_filing_index_at_url(url, client, index)
+    index_table = fetch_filing_index_at_url(url, index)
     return index_table
 
 
 def fetch_filing_index_at_url(url: str,
-                              client: Union[httpx.Client, httpx.AsyncClient],
-                              index: str):
-    index_text = download_text(url=url, client=client)
+                              index: str) -> Optional[pa.Table]:
+    index_text = download_text(url=url)
+    assert index_text is not None
     if index == "xbrl":
-        index_table: pa.Table = read_pipe_delimited_index(index_text)
+        index_table: pa.Table = read_pipe_delimited_index(str(index_text))
     else:
         # Read as a fixed width index file
-        file_specs: FileSpecs = form_specs if index == "form" else company_specs
-        index_table: pa.Table = read_fixed_width_index(index_text,
-                                                       file_specs=file_specs)
+        columns = FORM_INDEX_COLUMNS if index == "form" else COMPANY_INDEX_COLUMNS
+        index_table: pa.Table = read_index_file(index_text, columns=columns)
     return index_table
 
 
@@ -309,16 +409,13 @@ def get_filings_for_quarters(year_and_quarters: YearAndQuarters,
     :param index: The index to use - "form", "company", or "xbrl"
     :return:
     """
-    client = http_client()
 
     if len(year_and_quarters) == 1:
         _, final_index_table = fetch_filing_index(year_and_quarter=year_and_quarters[0],
-                                                    client=client,
-                                                    index=index)
+                                                  index=index)
     else:
         quarters_and_indexes = parallel(fetch_filing_index,
                                         items=year_and_quarters,
-                                        client=client,
                                         index=index,
                                         threadpool=True,
                                         progress=True
@@ -342,7 +439,7 @@ class Filings:
 
     def __init__(self,
                  filing_index: pa.Table,
-                 original_state: FilingsState = None):
+                 original_state: Optional[FilingsState] = None):
         self.data: pa.Table = filing_index
         self.data_pager = DataPager(self.data)
         # This keeps track of where the index should start in case this is just a page in the Filings
@@ -372,9 +469,9 @@ class Filings:
         )
 
     @property
-    def date_range(self) -> Tuple[datetime]:
+    def date_range(self) -> Tuple[datetime, datetime]:
         """Return a tuple of the start and end dates in the filing index"""
-        min_max_dates = pc.min_max(self.data['filing_date']).as_py()
+        min_max_dates: dict[str, datetime] = pc.min_max(self.data['filing_date']).as_py()
         return min_max_dates['min'], min_max_dates['max']
 
     @property
@@ -398,11 +495,18 @@ class Filings:
         return filings
 
     def filter(self,
-               form: Union[str, List[IntString]] = None,
+               form: Optional[Union[str, List[IntString]]] = None,
                amendments: bool = None,
-               filing_date: str = None,
-               date: str = None):
+               filing_date: Optional[str] = None,
+               date: Optional[str] = None,
+               cik: Union[IntString, List[IntString]] = None,
+               ticker: Union[str, List[str]] = None,
+               accession_number: Union[str, List[str]] = None) -> Optional['Filings']:
         """
+        Get some filings
+
+        >>> filings = get_filings()
+
         Filter the filings
 
         On a date
@@ -421,14 +525,24 @@ class Filings:
         :param amendments: Whether to include amendments to the forms e.g. include "10-K/A" if filtering for "10-K"
         :param filing_date: The filing date
         :param date: An alias for the filing date
+        :param cik: The CIK or list of CIKs to filter by
+        :param ticker: The ticker or list of tickers to filter by
+        :param accession_number: The accession number or list of accession numbers to filter by
         :return: The filtered filings
         """
         filing_index = self.data
         forms = form
 
+        if isinstance(forms, list):
+            forms = [str(f) for f in forms]
+
         # Filter by form
         if forms:
-            filing_index = filter_by_form(filing_index, forms, amendments=amendments)
+            filing_index = filter_by_form(filing_index, form=forms, amendments=amendments)
+        elif amendments is not None:
+            # Get the unique values of the form as a pylist
+            forms = list(set([form.replace("/A", "") for form in pc.unique(filing_index['form']).to_pylist()]))
+            filing_index = filter_by_form(filing_index, form=forms, amendments=amendments)
 
         # filing_date and date are aliases
         filing_date = filing_date or date
@@ -438,6 +552,17 @@ class Filings:
             except InvalidDateException as e:
                 log.error(e)
                 return None
+
+        # Filter by cik
+        if cik:
+            filing_index = filter_by_cik(filing_index, cik)
+
+        if ticker:
+            filing_index = filter_by_ticker(filing_index, ticker)
+
+        # Filter by accession number
+        if accession_number:
+            filing_index = filter_by_accession_number(filing_index, accession_number=accession_number)
 
         return Filings(filing_index)
 
@@ -477,7 +602,7 @@ class Filings:
         """Display the current page ... which is the default for this filings object"""
         return self
 
-    def next(self) -> Optional[pa.Table]:
+    def next(self):
         """Show the next page"""
         data_page = self.data_pager.next()
         if data_page is None:
@@ -487,7 +612,7 @@ class Filings:
         filings_state = FilingsState(page_start=start_index, num_filings=len(self))
         return Filings(data_page, original_state=filings_state)
 
-    def previous(self) -> Optional[pa.Table]:
+    def previous(self):
         """
         Show the previous page of the data
         :return:
@@ -512,6 +637,9 @@ class Filings:
 
     def get(self, index_or_accession_number: IntString):
         """
+        First, get some filings
+        >>> filings = get_filings()
+
         Get the Filing at that index location or that has the accession number
         >>> filings.get(100)
 
@@ -536,23 +664,16 @@ class Filings:
 
     def find(self,
              company_search_str: str):
-        from edgar._companies import find_company
+        from edgar.entities import find_company
 
         # Search for the company
         search_results = find_company(company_search_str)
-        cik_match_lookup = search_results.cik_match_lookup()
 
-        # Filter filings that are in the search results
-        ciks = search_results.data.cik.tolist()
-        filing_index = self.data.filter(pc.is_in(self.data['cik'], pa.array(ciks)))
+        return self.filter(cik=search_results.ciks)
 
-        # Sort by the match score
-        score_values = pa.array([cik_match_lookup.get(cik.as_py()) for cik in filing_index.column("cik")])
-        filing_index = filing_index.append_column("match", score_values)
-        filing_index = filing_index.sort_by([('match', 'descending'), ('company', 'ascending')]).drop(['match'])
-
-        # Need to sort by
-        return Filings(filing_index)
+    def to_dict(self, max_rows: int = 1000) -> Dict[str, Any]:
+        """Return the filings as a json string but only the first max_rows records"""
+        return cast(Dict[str, Any], self.to_pandas().head(max_rows).to_dict(orient="records"))
 
     def __getitem__(self, item):
         return self.get_filing_at(item)
@@ -588,29 +709,138 @@ class Filings:
             return range(*self.data_pager._current_range)
 
     def __rich__(self) -> Panel:
-        page = self.data_pager.current().to_pandas()
-        page.index = self._page_index()
+        # Create table with appropriate columns and styling
+        table = Table(
+            show_header=True,
+            header_style="bold",
+            show_edge=True,
+            expand=False,
+            padding=(0, 1),
+            box=box.SIMPLE,
+            row_styles=["", "bold"]
+        )
 
-        # Show paging information
-        page_info = f"Showing {len(page)} of {self._original_state.num_filings:,} filings"
+        # Add columns with specific styling and alignment
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Form", width=7)
+        table.add_column("CIK", style="dim", width=10, justify="right")
+        table.add_column("Ticker", width=6, style="yellow")
+        table.add_column("Company", style="bold green", width=38, no_wrap=True)
+        table.add_column("Filing Date", width=11)
+        table.add_column("Accession Number", style="dim", width=20)
 
+        # Get current page from data pager
+        current_page = self.data_pager.current()
+
+        # Calculate start index for proper indexing
+        start_idx = self._original_state.page_start if self._original_state else self.data_pager.start_index
+
+        # Iterate through rows in current page
+        for i in range(len(current_page)):
+            cik = current_page['cik'][i].as_py()
+            ticker = find_ticker(cik)
+
+            row = [
+                str(start_idx + i),
+                current_page['form'][i].as_py(),
+                str(cik),
+                ticker,
+                current_page['company'][i].as_py(),
+                str(current_page['filing_date'][i].as_py()),
+                current_page['accession_number'][i].as_py()
+            ]
+            table.add_row(*row)
+
+        # Show paging information only if there are multiple pages
+        elements = [table]
+
+        if self.data_pager.total_pages > 1:
+            total_filings = self._original_state.num_filings
+            current_count = len(current_page)
+            start_num = start_idx + 1
+            end_num = start_idx + current_count
+
+            page_info = Text.assemble(
+                ("Showing ", "dim"),
+                (f"{start_num:,}", "bold red"),
+                (" to ", "dim"),
+                (f"{end_num:,}", "bold red"),
+                (" of ", "dim"),
+                (f"{total_filings:,}", "bold"),
+                (" filings.", "dim"),
+                (" Page using ", "dim"),
+                ("← prev()", "bold gray54"),
+                (" and ", "dim"),
+                ("next() →", "bold gray54")
+            )
+
+            elements.extend([Text("\n"), page_info])
+
+        # Get the subtitle
+        start_date, end_date = self.date_range
+        subtitle = f"SEC Filings between {start_date:%Y-%m-%d} and {end_date:%Y-%m-%d}" if start_date else ""
         return Panel(
-            Group(
-                df_to_rich_table(page, max_rows=len(page)),
-                Text(page_info)
-            ), title="Filings"
+            Group(*elements),
+            title="SEC Filings",
+            subtitle=subtitle,
+            border_style="bold grey54"
         )
 
     def __repr__(self):
         return repr_rich(self.__rich__())
 
 
-def get_filings(year: Years = None,
-                quarter: Quarters = None,
-                form: Union[str, List[IntString]] = None,
+def sort_filings_by_priority(filing_table: pa.Table,
+                             priority_forms: Optional[List[str]] = None) -> pa.Table:
+    """
+    Sort a filings table by date (descending) and form priority.
+
+    Args:
+        filing_table: PyArrow table containing filings data
+        priority_forms: List of forms in priority order. Forms not in list will be sorted
+                       alphabetically after priority forms. Defaults to common forms if None.
+
+    Returns:
+        PyArrow table sorted by date and form priority
+    """
+    if priority_forms is None:
+        priority_forms = ['10-Q', '10-Q/A', '10-K', '10-K/A',  '8-K', '8-K/A',
+                          '6-K', '6-K/A', '13F-HR', '144',  '4', 'D', 'SC 13D', 'SC 13G']
+
+    # Create form priority values
+    forms_array = filing_table['form']
+    priorities = []
+    for form_type in forms_array.to_pylist():
+        try:
+            priority = priority_forms.index(form_type)
+        except ValueError:
+            priority = len(priority_forms)
+        priorities.append(priority)
+
+    # Add priority column
+    with_priority = filing_table.append_column(
+        'form_priority',
+        pa.array(priorities, type=pa.int32())
+    )
+
+    # Sort by date (descending), priority (ascending), form name (ascending)
+    sorted_table = with_priority.sort_by([
+        ("filing_date", "descending"),
+        ("form_priority", "ascending"),
+        ("form", "ascending")
+    ])
+
+    # Remove temporary priority column
+    return sorted_table.drop(['form_priority'])
+
+
+def get_filings(year: Optional[Years] = None,
+                quarter: Optional[Quarters] = None,
+                form: Optional[Union[str, List[IntString]]] = None,
                 amendments: bool = True,
-                filing_date: str = None,
-                index="form") -> Optional[Filings]:
+                filing_date: Optional[str] = None,
+                index="form",
+                priority_forms: Optional[List[str]] = None) -> Optional[Filings]:
     """
     Downloads the filing index for a given year or list of years, and a quarter or list of quarters.
 
@@ -651,11 +881,18 @@ def get_filings(year: Years = None,
     """
     # Get the year or default to the current year
     using_default_year = False
-    if not year:
+    if filing_date:
+        if not is_valid_filing_date(filing_date):
+            log.warning("""Provide a valid filing date in the format YYYY-MM-DD or YYYY-MM-DD:YYYY-MM-DD""")
+            return None
+        year_and_quarters = filing_date_to_year_quarters(filing_date)
+    elif not year:
         year, quarter = current_year_and_quarter()
+        year_and_quarters: YearAndQuarters = expand_quarters(year, quarter)
         using_default_year = True
+    else:
+        year_and_quarters: YearAndQuarters = expand_quarters(year, quarter)
 
-    year_and_quarters: YearAndQuarters = expand_quarters(year, quarter)
     if len(year_and_quarters) == 0:
         log.warning(f"""
     Provide a year between 1994 and {datetime.now().year} and optionally a quarter (1-4) for which the SEC has filings. 
@@ -666,23 +903,26 @@ def get_filings(year: Years = None,
     (You specified the year {year} and quarter {quarter})   
         """)
         return None
-    try:
-        filing_index = get_filings_for_quarters(year_and_quarters, index=index)
-    except httpx.HTTPStatusError as e:
-        if using_default_year and 'AccessDenied' in e.response.text:
-            previous_quarter = [get_previous_quarter(year, quarter)]
-            filing_index = get_filings_for_quarters(previous_quarter, index=index)
-        else:
-            raise
+    filing_index = get_filings_for_quarters(year_and_quarters, index=index)
 
     filings = Filings(filing_index)
 
     if form or filing_date:
         filings = filings.filter(form=form, amendments=amendments, filing_date=filing_date)
 
-    # Finally sort by filing date
-    filings = Filings(filings.data.sort_by([("filing_date", "descending")]))
-    return filings
+    if not filings:
+        if using_default_year:
+            # Ensure at least some data is returned
+            previous_quarter = [get_previous_quarter(year, quarter)]
+            filing_index = get_filings_for_quarters(previous_quarter, index=index)
+            sorted_filing_index = sort_filings_by_priority(filings.data, priority_forms)
+            return Filings(sorted_filing_index)
+        return None
+
+    # Sort the filings using the separate sort function
+    sorted_filing_index = sort_filings_by_priority(filings.data, priority_forms)
+
+    return Filings(sorted_filing_index)
 
 
 """
@@ -721,10 +961,10 @@ def parse_summary(summary: str):
     # Convert matches into a dictionary
     fields = {k.strip(): (int(v) if v.isdigit() else v) for k, v in matches}
 
-    return datetime.strptime(fields.get('Filed'), '%Y-%m-%d').date(), fields.get('AccNo')
+    return datetime.strptime(str(fields.get('Filed', '')), '%Y-%m-%d').date(), fields.get('AccNo')
 
 
-def get_current_url(atom: True,
+def get_current_url(atom: bool = True,
                     count: int = 100,
                     start: int = 0,
                     form: str = '',
@@ -741,10 +981,9 @@ def get_current_url(atom: True,
 
 
 @lru_cache(maxsize=32)
-def get_current_entries_on_page(count: int, start: int, form: str = None, owner: str = 'include'):
-    client = http_client()
-    url = get_current_url(count=count, start=start, form=form, owner=owner, atom=True)
-    response = retry_call(client.get, fargs=[url], tries=5, delay=3)
+def get_current_entries_on_page(count: int, start: int, form: Optional[str] = None, owner: str = 'include'):
+    url = get_current_url(count=count, start=start, form=form if form else '', owner=owner, atom=True)
+    response = get_with_retry(url)
 
     soup = BeautifulSoup(response.text, features="xml")
     entries = []
@@ -823,8 +1062,10 @@ class CurrentFilings(Filings):
             self._start = start
             return self
 
-    def __getitem__(self, item):
-        return self.get(item)
+    def __getitem__(self, item):  # type: ignore
+        item = self.get(item)
+        assert item is not None
+        return item
 
     def get(self, index_or_accession_number: IntString):
         if isinstance(index_or_accession_number, int) or index_or_accession_number.isdigit():
@@ -870,26 +1111,84 @@ class CurrentFilings(Filings):
         return None
 
     def __rich__(self):
-        page: pd.DataFrame = self.to_pandas()
+
+        # Create table with appropriate columns and styling
+        table = Table(
+            show_header=True,
+            header_style="bold",
+            show_edge=True,
+            expand=False,
+            padding=(0, 1),
+            box=box.SIMPLE,
+            row_styles=["", "bold"]
+        )
+
+        # Add columns with specific styling and alignment
+        table.add_column("#", style="dim", justify="right")
+        table.add_column("Form", width=7)
+        table.add_column("CIK", style="dim", width=10, justify="right")
+        table.add_column("Ticker", width=6, style="yellow")
+        table.add_column("Company", style="bold green", width=38, no_wrap=True)
+        table.add_column("Filing Date", width=11)
+        table.add_column("Accession Number", style="dim", width=20)
+
+        # Get current page from data pager
+        current_page = self.data.to_pandas()
 
         # compute the index from the start and page_size and set it as the index of the page
-        page.index = range(self._start - 1, self._start - 1 + len(page))
+        current_page.index = range(self._start - 1, self._start - 1 + len(current_page))
 
+        # Iterate through rows in current page
+        for t in current_page.itertuples():
+            cik = t.cik
+            ticker = find_ticker(cik)
+
+            row = [
+                str(t.Index),
+                t.form,
+                str(cik),
+                ticker,
+                t.company,
+                str(t.filing_date),
+                t.accession_number
+            ]
+            table.add_row(*row)
+
+        # Show paging information only if there are multiple pages
+        elements = [table]
+
+        page_info = Text.assemble(
+                ("Showing ", "dim"),
+                (f"{current_page.index.min():,}", "bold red"),
+                (" to ", "dim"),
+                (f"{current_page.index.max():,}", "bold red"),
+                (" most recent filings.", "dim"),
+                (" Page using ", "dim"),
+                ("← prev()", "bold gray54"),
+                (" and ", "dim"),
+                ("next() →", "bold gray54")
+            )
+
+        elements.extend([Text("\n"), page_info])
+
+        # Get the subtitle
+        start_date, end_date = self.date_range
+        subtitle = "Most recent filings from the SEC"
         return Panel(
-            Group(
-                df_to_rich_table(page),
-                Text(f"Filings {page.index.min()} to {page.index.max()}")
-            ), title=f"Current Filings on {self.start_date}"
+            Group(*elements),
+            title="SEC Filings",
+            subtitle=subtitle,
+            border_style="bold grey54"
         )
 
 
 @lru_cache(maxsize=8)
-def _get_cached_filings(year: Years = None,
-                        quarter: Quarters = None,
-                        form: Union[str, List[IntString]] = None,
+def _get_cached_filings(year: Optional[Years] = None,
+                        quarter: Optional[Quarters] = None,
+                        form: Optional[Union[str, List[IntString]]] = None,
                         amendments: bool = True,
-                        filing_date: str = None,
-                        index="form") -> Filings:
+                        filing_date: Optional[str] = None,
+                        index="form") -> Union[Filings, None]:
     # Get the filings but cache the result
     return get_filings(year=year, quarter=quarter, form=form, amendments=amendments, filing_date=filing_date,
                        index=index)
@@ -911,211 +1210,6 @@ def parse_filing_header(content):
     return data
 
 
-@dataclass(frozen=True)
-class CompanyInformation:
-    name: str
-    cik: str
-    sic: str
-    irs_number: str
-    state_of_incorporation: str
-    fiscal_year_end: str
-
-    def __rich__(self):
-        table = Table("Company", "SIC", "Incorp.", "Year End",
-                      title=company_title,
-                      box=box.SIMPLE)
-        table.add_row(f"{self.name} [{self.cik}]",
-                      self.sic,
-                      self.state_of_incorporation,
-                      self.fiscal_year_end)
-        return table
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
-
-
-@dataclass(frozen=True)
-class FilingInformation:
-    form: str
-    file_number: str
-    sec_act: str
-    film_number: str
-
-    def __rich__(self):
-        table = Table("File Number", "SEC Act", "Film #", "Form", title=filing_information_title, box=box.SIMPLE)
-        table.add_row(self.file_number, self.sec_act, self.film_number, self.form)
-        return table
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
-
-
-@dataclass(frozen=True)
-class FormerCompany:
-    name: str
-    date_of_change: str
-
-
-@dataclass(frozen=True)
-class Filer:
-    company_information: CompanyInformation
-    filing_information: FilingInformation
-    business_address: Address
-    mailing_address: Address
-    former_company_names: Optional[List[FormerCompany]] = None
-
-    def __rich__(self):
-        filer_renderables = [self.company_information]
-        # Addresses
-        if self.business_address or self.mailing_address:
-            filer_renderables.append(_create_address_table(self.business_address, self.mailing_address))
-
-        # Former Company Names
-        if self.former_company_names:
-            former_company_table = Table("Former Name", "Date Changed", box=box.SIMPLE)
-            for company in self.former_company_names:
-                former_company_table.add_row(company.name, company.date_of_change)
-            filer_renderables.append(former_company_table)
-
-        return Panel(
-            Group(*filer_renderables),
-            title="FILER"
-        )
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
-
-
-@dataclass(frozen=True)
-class Owner:
-    name: str
-    cik: str
-
-
-@dataclass(frozen=True)
-class ReportingOwner:
-    owner: Owner
-    company_information: CompanyInformation
-    filing_information: FilingInformation
-    business_address: Address
-    mailing_address: Address
-
-    def __rich__(self):
-        top_renderables = []
-        reporting_owner_renderables = []
-
-        # Owner Table
-        if self.owner:
-            reporting_owner_table = Table("Owner", "CIK", box=box.SIMPLE)
-            reporting_owner_table.add_row(self.owner.name, self.owner.cik)
-
-            top_renderables = [reporting_owner_table]
-        # Reporting Owner Filing Values
-        if self.filing_information:
-            filing_values_table = Table("File Number", "SEC Act", "Film #", box=box.SIMPLE)
-            filing_values_table.add_row(self.filing_information.file_number,
-                                        self.filing_information.sec_act,
-                                        self.filing_information.film_number)
-            top_renderables.append(filing_values_table)
-
-        reporting_owner_renderables = [Columns(top_renderables)]
-
-        # Addresses
-        if self.business_address or self.mailing_address:
-            reporting_owner_renderables.append(_create_address_table(self.business_address, self.mailing_address))
-
-        return Panel(
-            Group(
-                *reporting_owner_renderables
-            ),
-            title=reporting_owner_title
-        )
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
-
-
-@dataclass(frozen=True)
-class SubjectCompany:
-    company_information: CompanyInformation
-    filing_information: FilingInformation
-    business_address: Address
-    mailing_address: Address
-    former_company_names: Optional[List[FormerCompany]] = None
-
-    def __rich__(self):
-        subject_company_renderables = []
-
-        # Filing Information
-        if self.filing_information:
-            subject_company_renderables.append(self.filing_information)
-
-        subject_company_renderables.append(self.company_information)
-
-        # Addresses
-        if self.business_address or self.mailing_address:
-            subject_company_renderables.append(_create_address_table(self.business_address, self.mailing_address))
-
-        # Former Company Names
-        if self.former_company_names:
-            former_company_table = Table("Former Name", "Date Changed", box=box.SIMPLE)
-            for company in self.former_company_names:
-                former_company_table.add_row(company.name, company.date_of_change)
-            subject_company_renderables.append(former_company_table)
-
-        return Panel(
-            Group(
-                *subject_company_renderables
-            ),
-            title="SUBJECT COMPANY"
-        )
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
-
-
-@dataclass(frozen=True)
-class Issuer:
-    company_information: CompanyInformation
-    business_address: Address
-    mailing_address: Address
-
-    def __rich__(self):
-        issuer_table = Table("Company", "CIK", "SIC", "Fiscal Year End",
-                             box=box.SIMPLE)
-        issuer_table.add_row(self.company_information.name,
-                             self.company_information.cik,
-                             self.company_information.sic,
-                             self.company_information.fiscal_year_end)
-
-        # The list of renderables for the issuer panel
-        issuer_renderables = [issuer_table]
-
-        # Addresses
-        if self.business_address or self.mailing_address:
-            issuer_renderables.append(_create_address_table(self.business_address, self.mailing_address))
-
-        return Panel(
-            Group(
-                *issuer_renderables
-            ),
-            title=issuer_title
-        )
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
-
-
-# Title text
-mailing_address_title = "\U0001F4EC Mailing Address"
-business_address_title = "\U0001F4EC Business Address"
-company_title = "\U0001F3E2 Company Information"
-filing_information_title = "\U0001F4D1 Filing Information"
-reporting_owner_title = "\U0001F468 REPORTING OWNER"
-issuer_title = "\U0001F4B5 ISSUER"
-filing_title = "\U0001F4D1 FILING"
-
-
 def _create_address_table(business_address: Address, mailing_address: Address):
     address_table = Table("Type", "Street1", "Street2", "City", "State", "Zipcode",
                           title="\U0001F4EC Addresses", box=box.SIMPLE)
@@ -1135,394 +1229,6 @@ def _create_address_table(business_address: Address, mailing_address: Address):
                               mailing_address.state_or_country,
                               mailing_address.zipcode)
     return address_table
-
-
-class SECHeader:
-    """
-    Contains the parsed representation of the SEC-HEADER text at the top of the full submission text
-    <SEC-HEADER>
-
-    </SEC-HEADER>
-    """
-
-    def __init__(self,
-                 text: str,
-                 filing_metadata: Dict[str, str],
-                 filers: List[Filer] = None,
-                 reporting_owners: List[ReportingOwner] = None,
-                 issuers: List[Issuer] = None,
-                 subject_companies: List[SubjectCompany] = None):
-        self.text: str = text
-        self.filing_metadata: Dict[str, str] = filing_metadata
-        self.filers: List[Filer] = filers
-        self.reporting_owners: List[ReportingOwner] = reporting_owners
-        self.issuers: List[Issuer] = issuers
-        self.subject_companies: List[SubjectCompany] = subject_companies
-
-    @property
-    def accession_number(self):
-        return self.filing_metadata.get("ACCESSION NUMBER")
-
-    @property
-    def form(self):
-        return self.filing_metadata.get("CONFORMED SUBMISSION TYPE")
-
-    @property
-    def period_of_report(self):
-        return self.filing_metadata.get("CONFORMED PERIOD OF REPORT")
-
-    @property
-    def filing_date(self):
-        return self.filing_metadata.get("FILED AS OF DATE")
-
-    @property
-    def date_as_of_change(self):
-        return self.filing_metadata.get("DATE AS OF CHANGE")
-
-    @property
-    def document_count(self):
-        return self.filing_metadata.get("PUBLIC DOCUMENT COUNT", 0)
-
-    @property
-    def acceptance_datetime(self):
-        acceptance = self.filing_metadata.get("ACCEPTANCE-DATETIME")
-        if acceptance:
-            return datetime.strptime(acceptance, "%Y%m%d%H%M%S")
-
-    @property
-    def file_numbers(self):
-        """Return the file numbers associated with this filing"""
-        numbers = []
-        if self.filers:
-            numbers.extend([filer.filing_information.file_number for filer in self.filers])
-        if self.reporting_owners:
-            numbers.extend(
-                [reporting_owner.filing_information.file_number for reporting_owner in self.reporting_owners])
-        if self.subject_companies:
-            numbers.extend(
-                [subject_company.filing_information.file_number for subject_company in self.subject_companies])
-        return list(set(numbers))
-
-    @classmethod
-    def parse(cls, header_text: str):
-        data = {}
-        current_header = None
-        current_subheader = None
-
-        # Read the lines in the content. This starts with <ACCEPTANCE-DATETIME>20230606213204
-        lines = header_text.split('\n')
-        for index, line in enumerate(header_text.split('\n')):
-            if not line:
-                continue
-
-            # Keep track of the nesting level
-            nesting_level = len(line) - len(line.lstrip('\t'))
-
-            # Nested increases
-            nesting_will_increase = index < len(lines) - 1 and nesting_level < len(lines[index + 1]) - len(
-                lines[index + 1].lstrip('\t'))
-
-            # The line ends with a ':' meaning nested content follows e.g. "REPORTING-OWNER:"
-            line_ends_with_colon = line.rstrip('\t').endswith(':')
-
-            is_header = (nesting_level == 0 and line_ends_with_colon) or nesting_will_increase
-            if is_header:
-                # Nested line means a subheader e.g. "OWNER DATA:"
-                if line.startswith('\t'):
-                    current_subheader = line.strip().split(':')[0]
-                    if current_subheader == "FORMER COMPANY":  # Special case. This is a list of companies
-                        if current_subheader not in data[current_header][-1]:
-                            data[current_header][-1][current_subheader] = []
-                        data[current_header][-1][current_subheader].append({})
-                    else:
-                        data[current_header][-1][current_subheader] = {}  # Expect only one record per key
-
-                # Top level header
-                else:
-                    current_header = line.strip().split(':')[0]
-                    if current_header not in data:
-                        data[current_header] = []
-                    data[current_header].append({})
-            else:
-                if line.strip().startswith("<"):
-                    # The line looks like this <KEY>VALUE
-                    key, value = line.split('>')
-                    # Strip the leading '<' from the key
-                    data[key[1:]] = value
-                elif ':' in line:
-                    parts = line.strip().split(':')
-                    if len(parts) == 2:
-                        key, value = line.strip().split(':')
-                    else:
-                        key, value = parts[0], ":".join(parts[1:])
-                    value = value.strip()
-                    if not current_header:
-                        data[key] = value
-                    elif not current_subheader:
-                        continue
-                    else:
-                        if current_subheader == "FORMER COMPANY":
-                            data[current_header][-1][current_subheader][-1][key.strip()] = value
-                        else:
-                            data[current_header][-1][current_subheader][key.strip()] = value
-
-        # The filer
-        filers = []
-        for filer_values in data.get('FILER', data.get('FILED BY', {})):
-            filer_company_values = filer_values.get('COMPANY DATA')
-            company_obj = None
-            if filer_company_values:
-                company_obj = CompanyInformation(
-                    name=filer_company_values.get('COMPANY CONFORMED NAME'),
-                    cik=filer_company_values.get('CENTRAL INDEX KEY'),
-                    sic=filer_company_values.get('STANDARD INDUSTRIAL CLASSIFICATION'),
-                    irs_number=filer_company_values.get('IRS NUMBER'),
-                    state_of_incorporation=filer_company_values.get('STATE OF INCORPORATION'),
-                    fiscal_year_end=filer_company_values.get('FISCAL YEAR END')
-                )
-            # Filing Values
-            filing_values_text_section = filer_values.get('FILING VALUES')
-            filing_values_obj = None
-            if filing_values_text_section:
-                filing_values_obj = FilingInformation(
-                    form=filing_values_text_section.get('FORM TYPE'),
-                    sec_act=filing_values_text_section.get('SEC ACT'),
-                    file_number=filing_values_text_section.get('SEC FILE NUMBER'),
-                    film_number=filing_values_text_section.get('FILM NUMBER')
-                )
-            # Now create the filer
-            filer = Filer(
-                company_information=company_obj,
-                filing_information=filing_values_obj,
-                business_address=Address(
-                    street1=filer_values['BUSINESS ADDRESS'].get('STREET 1'),
-                    street2=filer_values['BUSINESS ADDRESS'].get('STREET 2'),
-                    city=filer_values['BUSINESS ADDRESS'].get('CITY'),
-                    state_or_country=filer_values['BUSINESS ADDRESS'].get('STATE'),
-                    zipcode=filer_values['BUSINESS ADDRESS'].get('ZIP'),
-
-                ) if 'BUSINESS ADDRESS' in filer_values else None,
-                mailing_address=Address(
-                    street1=filer_values['MAIL ADDRESS'].get('STREET 1'),
-                    street2=filer_values['MAIL ADDRESS'].get('STREET 2'),
-                    city=filer_values['MAIL ADDRESS'].get('CITY'),
-                    state_or_country=filer_values['MAIL ADDRESS'].get('STATE'),
-                    zipcode=filer_values['MAIL ADDRESS'].get('ZIP'),
-
-                ) if 'MAIL ADDRESS' in filer_values else None,
-                former_company_names=[FormerCompany(date_of_change=record.get('DATE OF NAME CHANGE'),
-                                                    name=record.get('FORMER CONFORMED NAME'))
-                                      for record in filer_values['FORMER COMPANY']
-                                      ]
-                if 'FORMER COMPANY' in filer_values else None
-            )
-            filers.append(filer)
-
-        # Reporting Owner
-
-        reporting_owners = []
-
-        for reporting_owner_values in data.get('REPORTING-OWNER', []):
-            reporting_owner = None
-
-            if reporting_owner_values:
-                owner, name, cik = None, None, None
-                if "OWNER DATA" in reporting_owner_values:
-                    name = reporting_owner_values.get('OWNER DATA').get('COMPANY CONFORMED NAME')
-                    cik = reporting_owner_values.get('OWNER DATA').get('CENTRAL INDEX KEY')
-                elif 'COMPANY DATA' in reporting_owner_values:
-                    name = reporting_owner_values['COMPANY DATA'].get('COMPANY CONFORMED NAME')
-                    cik = reporting_owner_values['COMPANY DATA'].get('CENTRAL INDEX KEY')
-                if cik:
-                    from edgar._companies import Entity
-                    entity: Entity = Entity(cik)
-                    if not entity.is_company:
-                        name = reverse_name(name)
-                    owner = Owner(name=name, cik=cik)
-
-                # Company Information
-                company_information = CompanyInformation(
-                    name=reporting_owner_values.get('COMPANY DATA').get('COMPANY CONFORMED NAME'),
-                    cik=reporting_owner_values.get('COMPANY DATA').get('CENTRAL INDEX KEY'),
-                    sic=reporting_owner_values.get('COMPANY DATA').get('STANDARD INDUSTRIAL CLASSIFICATION'),
-                    irs_number=reporting_owner_values.get('COMPANY DATA').get('IRS NUMBER'),
-                    state_of_incorporation=reporting_owner_values.get('COMPANY DATA').get('STATE OF INCORPORATION'),
-                    fiscal_year_end=reporting_owner_values.get('COMPANY DATA').get('FISCAL YEAR END')
-                ) if "COMPANY DATA" in reporting_owner_values else None
-
-                # Filing Information
-                filing_information = FilingInformation(
-                    form=reporting_owner_values.get('FILING VALUES').get('FORM TYPE'),
-                    sec_act=reporting_owner_values.get('FILING VALUES').get('SEC ACT'),
-                    file_number=reporting_owner_values.get('FILING VALUES').get('SEC FILE NUMBER'),
-                    film_number=reporting_owner_values.get('FILING VALUES').get('FILM NUMBER')
-                ) if ('FILING VALUES' in reporting_owner_values and
-                      reporting_owner_values.get('FILING VALUES').get('SEC FILE NUMBER')) else None
-
-                # Business Address
-                business_address = Address(
-                    street1=reporting_owner_values.get('BUSINESS ADDRESS').get('STREET 1'),
-                    street2=reporting_owner_values.get('BUSINESS ADDRESS').get('STREET 2'),
-                    city=reporting_owner_values.get('BUSINESS ADDRESS').get('CITY'),
-                    state_or_country=reporting_owner_values.get('BUSINESS ADDRESS').get('STATE'),
-                    zipcode=reporting_owner_values.get('BUSINESS ADDRESS').get('ZIP'),
-                ) if 'BUSINESS ADDRESS' in reporting_owner_values else None
-
-                # Mailing Address
-                mailing_address = Address(
-                    street1=reporting_owner_values.get('MAIL ADDRESS').get('STREET 1'),
-                    street2=reporting_owner_values.get('MAIL ADDRESS').get('STREET 2'),
-                    city=reporting_owner_values.get('MAIL ADDRESS').get('CITY'),
-                    state_or_country=reporting_owner_values.get('MAIL ADDRESS').get('STATE'),
-                    zipcode=reporting_owner_values.get('MAIL ADDRESS').get('ZIP'),
-                ) if 'MAIL ADDRESS' in reporting_owner_values else None
-
-                # Now create the reporting owner
-                reporting_owner = ReportingOwner(
-                    owner=owner,
-                    company_information=company_information,
-                    filing_information=filing_information,
-                    business_address=business_address,
-                    mailing_address=mailing_address
-                )
-            reporting_owners.append(reporting_owner)
-
-        # Issuer
-        issuers = []
-        for issuer_values in data.get('ISSUER', []):
-            issuer = Issuer(
-                company_information=CompanyInformation(
-                    name=issuer_values.get('COMPANY DATA').get('COMPANY CONFORMED NAME'),
-                    cik=issuer_values.get('COMPANY DATA').get('CENTRAL INDEX KEY'),
-                    sic=issuer_values.get('COMPANY DATA').get('STANDARD INDUSTRIAL CLASSIFICATION'),
-                    irs_number=issuer_values.get('COMPANY DATA').get('IRS NUMBER'),
-                    state_of_incorporation=issuer_values.get('COMPANY DATA').get('STATE OF INCORPORATION'),
-                    fiscal_year_end=issuer_values.get('COMPANY DATA').get('FISCAL YEAR END')
-                ) if 'COMPANY DATA' in issuer_values else None,
-                business_address=Address(
-                    street1=issuer_values.get('BUSINESS ADDRESS').get('STREET 1'),
-                    street2=issuer_values.get('BUSINESS ADDRESS').get('STREET 2'),
-                    city=issuer_values.get('BUSINESS ADDRESS').get('CITY'),
-                    state_or_country=issuer_values.get('BUSINESS ADDRESS').get('STATE'),
-                    zipcode=issuer_values.get('BUSINESS ADDRESS').get('ZIP'),
-                ) if 'BUSINESS ADDRESS' in issuer_values else None,
-                mailing_address=Address(
-                    street1=issuer_values.get('MAIL ADDRESS').get('STREET 1'),
-                    street2=issuer_values.get('MAIL ADDRESS').get('STREET 2'),
-                    city=issuer_values.get('MAIL ADDRESS').get('CITY'),
-                    state_or_country=issuer_values.get('MAIL ADDRESS').get('STATE'),
-                    zipcode=issuer_values.get('MAIL ADDRESS').get('ZIP'),
-                ) if 'MAIL ADDRESS' in issuer_values else None
-            )
-            issuers.append(issuer)
-
-        subject_companies = []
-        for subject_company_values in data.get('SUBJECT COMPANY', []):
-            subject_company = SubjectCompany(
-                company_information=CompanyInformation(
-                    name=subject_company_values.get('COMPANY DATA').get('COMPANY CONFORMED NAME'),
-                    cik=subject_company_values.get('COMPANY DATA').get('CENTRAL INDEX KEY'),
-                    sic=subject_company_values.get('COMPANY DATA').get('STANDARD INDUSTRIAL CLASSIFICATION'),
-                    irs_number=subject_company_values.get('COMPANY DATA').get('IRS NUMBER'),
-                    state_of_incorporation=subject_company_values.get('COMPANY DATA').get('STATE OF INCORPORATION'),
-                    fiscal_year_end=subject_company_values.get('COMPANY DATA').get('FISCAL YEAR END')
-                ) if 'COMPANY DATA' in subject_company_values else None,
-                filing_information=FilingInformation(
-                    form=subject_company_values.get('FILING VALUES').get('FORM TYPE'),
-                    sec_act=subject_company_values.get('FILING VALUES').get('SEC ACT'),
-                    file_number=subject_company_values.get('FILING VALUES').get('SEC FILE NUMBER'),
-                    film_number=subject_company_values.get('FILING VALUES').get('FILM NUMBER')
-                ) if 'FILING VALUES' in subject_company_values else None,
-                business_address=Address(
-                    street1=subject_company_values.get('BUSINESS ADDRESS').get('STREET 1'),
-
-                    street2=subject_company_values.get('BUSINESS ADDRESS').get('STREET 2'),
-                    city=subject_company_values.get('BUSINESS ADDRESS').get('CITY'),
-                    state_or_country=subject_company_values.get('BUSINESS ADDRESS').get('STATE'),
-                    zipcode=subject_company_values.get('BUSINESS ADDRESS').get('ZIP'),
-                ) if 'BUSINESS ADDRESS' in subject_company_values else None,
-                mailing_address=Address(
-                    street1=subject_company_values.get('MAIL ADDRESS').get('STREET 1'),
-                    street2=subject_company_values.get('MAIL ADDRESS').get('STREET 2'),
-                    city=subject_company_values.get('MAIL ADDRESS').get('CITY'),
-                    state_or_country=subject_company_values.get('MAIL ADDRESS').get('STATE'),
-                    zipcode=subject_company_values.get('MAIL ADDRESS').get('ZIP'),
-                ) if 'MAIL ADDRESS' in subject_company_values else None,
-                former_company_names=[FormerCompany(date_of_change=record.get('DATE OF NAME CHANGE'),
-                                                    name=record.get('FORMER CONFORMED NAME'))
-                                      for record in subject_company_values['FORMER COMPANY']
-                                      ]
-                if 'FORMER COMPANY' in subject_company_values else None
-            )
-            subject_companies.append(subject_company)
-
-        # Create a dict of the values in data that are not nested dicts
-        filing_metadata = {key: value
-                           for key, value in data.items()
-                           if isinstance(value, str) and value}
-
-        # The header text contains <ACCEPTANCE-DATETIME>20230612172243. Replace with the formatted date
-        header_text = re.sub(r'<ACCEPTANCE-DATETIME>(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})',
-                             r'ACCEPTANCE-DATETIME:            \1-\2-\3 \4:\5:\6', header_text)
-
-        # Remove empty lines from header_text
-        header_text = '\n'.join([line for line in header_text.split('\n') if line.strip()])
-
-        # Create the Header object
-        return cls(
-            text=header_text,
-            filing_metadata=filing_metadata,
-            filers=filers,
-            reporting_owners=reporting_owners,
-            issuers=issuers,
-            subject_companies=subject_companies
-        )
-
-    def __rich__(self):
-
-        # Filing Metadata
-        metadata_table = Table(row_styles=["bold", ""], box=box.ROUNDED)
-        metadata_table.add_column("")
-        metadata_table.add_column("Value", style="bold")
-        for key, value in self.filing_metadata.items():
-            # Format as dates
-            if re.match(r"^(20|19)\d{12}$", value):
-                value = datefmt(value, "%Y-%m-%d %H:%M:%S")
-            elif re.match(r"^(20|19)\d{6}$", value):
-                value = datefmt(value, "%Y-%m-%d")
-
-            metadata_table.add_row(f"{key}:", value)
-
-        metadata_panel = Panel(
-            metadata_table, title=f"Form {self.form} {unicode_for_form(self.form)} FILING"
-        )
-
-        # Keep a list of renderables for rich
-        renderables = [metadata_panel]
-
-        # SUBJECT COMPANY
-        for subject_company in self.subject_companies:
-            renderables.append(subject_company.__rich__())
-
-        # FILER
-        for filer in self.filers:
-            renderables.append(filer.__rich__())
-
-        # REPORTING OWNER
-        for reporting_owner in self.reporting_owners:
-            renderables.append(reporting_owner.__rich__())
-
-        # ISSUER
-        for issuer in self.issuers:
-            renderables.append(issuer.__rich__())
-        return Panel(
-            Group(
-                *renderables
-            )
-        )
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
 
 
 class Filing:
@@ -1562,69 +1268,171 @@ class Filing:
         return self.homepage.primary_documents
 
     @property
+    def period_of_report(self):
+        """
+        Get the period of report for the filing
+        """
+        return self.homepage.period_of_report
+
+    @property
     def attachments(self):
         # Return all the attachments on the filing
         return self.homepage.attachments
 
+    @property
+    def exhibits(self):
+        # Return all the exhibits on the filing
+        return self.homepage.attachments.exhibits
+
     def html(self) -> Optional[str]:
         """Returns the html contents of the primary document if it is html"""
-        if self.document.is_binary():
-            log.info(f"Primary document {self.document.url} is a binary file")
-        else:
-            return self.document.download()
+        if self.document and not self.document.is_binary() and not self.document.empty:
+            return str(self.document.download())
 
+    @lru_cache(maxsize=4)
     def xml(self) -> Optional[str]:
         """Returns the xml contents of the primary document if it is xml"""
-        xml_document: Attachment = self.homepage.primary_xml_document
+        xml_document = self.homepage.primary_xml_document
         if xml_document:
-            return xml_document.download()
+            return str(xml_document.download())
 
     @lru_cache(maxsize=4)
     def text(self) -> str:
         """Convert the html of the main filing document to text"""
         html_content = self.html()
-        if html_content:
-            return HtmlDocument.from_html(html_content).text
+        if html_content and has_html_content(html_content):
+            document = Document.parse(html_content)
+            return rich_to_text(document, 200)
+        else:
+            return self._download_filing_text()
+
+    def _download_filing_text(self):
+        """
+        Download the text of the filing directly from the primary tesxt sources.
+        Either from the text url or the text extract attachment
+        """
+        text_extract_attachments = self.attachments.query("document_type == 'TEXT-EXTRACT'")
+        if len(text_extract_attachments) > 0 and text_extract_attachments[0] is not None:
+            text_extract_attachment = text_extract_attachments[0]
+            assert text_extract_attachment is not None
+            return download_text_between_tags(text_extract_attachment.url, "TEXT")
+        else:
+            return download_text_between_tags(self.text_url, "TEXT")
+
 
     def full_text_submission(self) -> str:
         """Return the complete text submission file"""
-        return download_file(self.text_url)
+        downloaded = download_file(self.text_url, as_text=True)
+        assert downloaded is not None
+        return str(downloaded)
 
     def markdown(self) -> str:
         """return the markdown version of this filing html"""
         html = self.html()
         if html:
-            return html_to_markdown(get_clean_html(self.html()))
+            clean_html = get_clean_html(html)
+            if clean_html:
+                return to_markdown(clean_html)
+        text_content = self.text()
+        return text_to_markdown(text_content)
 
     def view(self):
         """Preview this filing's primary document as markdown. This should display in the console"""
-        html = self.html()
-        if html:
-            markdown_content = MarkdownContent(self.html())
-            markdown_content.view()
+        html_content = self.html()
+        if html_content:
+            document = Document.parse(html_content)
+            print_rich(document)
+        else:
+            print(self.text())
 
-    def xbrl(self, download_only: bool = False) -> Optional[FilingXbrl]:
+    def xbrl(self) -> Optional[Union[XBRLData, XBRLInstance]]:
         """
         Get the XBRL document for the filing, parsed and as a FilingXbrl object
         :return: Get the XBRL document for the filing, parsed and as a FilingXbrl object, or None
         """
-        xbrl_document = self.homepage.xbrl_document
-        if xbrl_document:
-            xbrl_text = xbrl_document.download()
+        return get_xbrl_object(self)
 
-            if xbrl_text is None:
-                log.info("No XBRL result")
+    def serve(self, port: int = 8000) -> AttachmentServer:
+        """Serve the filings on a local server
+        port: The port to serve the filings on
+        """
+        return self.attachments.serve(port=port)
 
-            if download_only: 
-                return None
-            else:
-                return FilingXbrl.parse(xbrl_text)
+    def save(self, directory_or_file: PathLike):
+        """Save the filing to a directory path or a file using pickle.dump
+
+            If directory_or_file is a directory then the final file will be
+
+            '<directory>/<accession_number>.pkl'
+
+            Otherwise, save to the file passed in
+        """
+        filing_path = Path(directory_or_file)
+        if filing_path.is_dir():
+            filing_path = filing_path / f"{self.accession_no}.pkl"
+        with filing_path.open("wb") as f:
+            pickle.dump(self, f)
+
+    @classmethod
+    def load(cls, path: PathLike):
+        """Load a filing from a json file"""
+        path = Path(path)
+        with path.open("rb") as file:
+            return pickle.load(file)
+
+    @property
+    @lru_cache(maxsize=1)
+    def filing_directory(self) -> FilingDirectory:
+        return FilingDirectory.load(self.base_dir)
+
+    @cached_property
+    def filing_sgml(self) -> str:
+        return FilingSgml.from_filing(self)
+
+    @property
+    @lru_cache(maxsize=1)
+    def index_headers(self) -> IndexHeaders:
+        index_headers_url = f"{self.base_dir}/{self.accession_no}-index-headers.html"
+        index_header_text = download_text(index_headers_url)
+        return IndexHeaders.load(index_header_text)
+
+    def to_dict(self) -> Dict[str, Union[str, int]]:
+        """Return the filing as a Dict string"""
+        return {'accession_number': self.accession_number,
+                'cik': self.cik,
+                'company': self.company,
+                'form': self.form,
+                'filing_date': self.filing_date}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Union[str, int]]):
+        """Create a Filing from a dictionary.
+        Thw dict must have the keys cik, company, form, filing_date, accession_no
+        """
+        assert all(key in data for key in ['cik', 'company', 'form', 'filing_date', 'accession_number']), \
+            "The dict must have the keys cik, company, form, filing_date, accession_number"
+        return cls(cik=int(data['cik']),
+                   company=str(data['company']),
+                   form=str(data['form']),
+                   filing_date=str(data['filing_date']),
+                   accession_no=str(data['accession_number']))
+
+    @classmethod
+    def from_json(cls, path: str):
+        """Create a Filing from a JSON file"""
+        with open(path, 'r') as file:
+            data = json.load(file)
+            return cls.from_dict(data)
 
     @property
     @lru_cache(maxsize=1)
     def header(self):
-        sec_header_content = get_text_between_tags(self.text_url, "SEC-HEADER")
-        return SECHeader.parse(sec_header_content)
+        sec_header_content = download_text_between_tags(self.text_url, "SEC-HEADER")
+        try:
+            return FilingHeader.parse_from_sgml_text(sec_header_content)
+        except Exception:
+            # Try again with preprocessing - likely with a filing from the 1990's
+            return FilingHeader.parse_from_sgml_text(sec_header_content, preprocess=True)
 
     def data_object(self):
         """ Get this filing as the data object that it might be"""
@@ -1641,11 +1449,14 @@ class Filing:
 
     def open(self):
         """Open the main filing document"""
+        assert self.document is not None
         webbrowser.open(self.document.url)
 
     @lru_cache(maxsize=1)
     def sections(self) -> List[str]:
-        return html_sections(self.html())
+        html = self.html()
+        assert html is not None
+        return html_sections(html)
 
     @lru_cache(maxsize=1)
     def __get_bm25_search_index(self):
@@ -1669,7 +1480,15 @@ class Filing:
 
     @property
     def text_url(self) -> str:
-        return f"{sec_edgar}/data/{self.cik}/{self.accession_no.replace('-', '')}/{self.accession_no}.txt"
+        return f"{self.base_dir}/{self.accession_no}.txt"
+
+    @property
+    def index_header_url(self) -> str:
+        return f"{self.base_dir}/index-headers.html"
+
+    @property
+    def base_dir(self) -> str:
+        return f"{sec_edgar}/data/{self.cik}/{self.accession_no.replace('-', '')}"
 
     @property
     def url(self) -> str:
@@ -1682,10 +1501,7 @@ class Filing:
         :return: the FilingHomepage
         """
         if not self._filing_homepage:
-            homepage_html = download_text(self.homepage_url)
-            self._filing_homepage = FilingHomepage.from_html(homepage_html,
-                                                             url=self.homepage_url,
-                                                             filing=self)
+            self._filing_homepage = FilingHomepage.load(self.homepage_url)
         return self._filing_homepage
 
     @property
@@ -1697,15 +1513,18 @@ class Filing:
     def get_entity(self):
         """Get the company to which this filing belongs"""
         "Get the company for cik. Cache for performance"
-        from edgar._companies import CompanyData
+        from edgar.entities import CompanyData
         return CompanyData.for_cik(self.cik)
 
     @lru_cache(maxsize=1)
     def as_company_filing(self):
         """Get this filing as a company filing. Company Filings have more information"""
         company = self.get_entity()
+        if not company:
+            return None
+
         filings = company.get_filings(accession_number=self.accession_no)
-        if not filings.empty:
+        if filings and not filings.empty:
             return filings[0]
 
     @lru_cache(maxsize=1)
@@ -1716,8 +1535,11 @@ class Filing:
         then this filing then get the related filings
         """
         company = self.get_entity()
+        if not company:
+            return
+
         filings = company.get_filings(accession_number=self.accession_no)
-        if not filings.empty:
+        if filings and not filings.empty:
             file_number = filings[0].file_number
             return company.get_filings(file_number=file_number,
                                        sort_by=[("filing_date", "ascending"), ("accession_number", "ascending")])
@@ -1759,154 +1581,28 @@ class Filing:
         └──────────────────────┴──────┴────────────┴────────────────────┴─────────┘
         :return: a rich table version of this filing
         """
-        summary_table = Table(box=box.SIMPLE)
-        summary_table.add_column("Accession Number", style="bold", header_style="bold")
-        summary_table.add_column("Filing Date")
-        summary_table.add_column("Company")
-        summary_table.add_column("CIK")
-        summary_table.add_row(self.accession_no, str(self.filing_date), self.company, str(self.cik))
+        summary_table = Table(box=box.ROUNDED, show_header=False)
+        summary_table.add_column("Accession#", style="bold deep_sky_blue1", header_style="bold")
+        summary_table.add_column("Filed")
+        summary_table.add_row(self.accession_no, str(self.filing_date))
 
         homepage_url = Text(f"\U0001F3E0 {self.homepage_url.replace('//www.', '//')}")
-        primary_doc_url = Text(f"\U0001F4C4 {self.document.url.replace('//www.', '//')}")
+        primary_doc_url = Text(f"\U0001F4C4 {self.document.url.replace('//www.', '//') if self.document else ''}")
         submission_text_url = Text(f"\U0001F4DC {self.text_url.replace('//www.', '//')}")
 
         links_table = Table(
             "[b]Links[/b]: \U0001F3E0 Homepage \U0001F4C4 Primary Document \U0001F4DC Full Submission Text",
-            box=box.SIMPLE)
+            box=box.ROUNDED)
         links_table.add_row(homepage_url)
         links_table.add_row(primary_doc_url)
         links_table.add_row(submission_text_url)
 
         return Panel(
             Group(summary_table, links_table),
-            title=f"{self.form} {unicode_for_form(self.form)} filing for {self.company}",
+            title=Text(f"{self.company} [{self.cik}] {self.form} {unicode_for_form(self.form)}", style="bold"),
+            subtitle=describe_form(self.form),
             box=box.ROUNDED
         )
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
-
-
-class Attachments:
-
-    def __init__(self, files: pd.DataFrame):
-        self.files = files
-        # Replace \xa0 with '-' in the Seq
-        self.files['Seq'] = self.files['Seq'].str.replace('\xa0', '-')
-
-    def __getitem__(self, item):
-        if isinstance(item, str):
-            res = self.files[self.files['Document'] == item]
-            if not res.empty:
-                return Attachment.from_dataframe_row(res.iloc[0])
-        elif isinstance(item, int):
-            if 0 <= item < len(self.files):
-                return Attachment.from_dataframe_row(self.files.iloc[item])
-
-    def get(self, item):
-        return self.__getitem__(item)
-
-    def query(self, query: str):
-        # Get the attachments by type
-        results = self.files.query(query)
-        if len(results) > 1:
-            return Attachments(results)
-        elif len(results) == 1:
-            return Attachment.from_dataframe_row(results.iloc[0])
-
-    def __len__(self):
-        return len(self.files)
-
-    def __rich__(self):
-        return df_to_rich_table(self.files
-                                .assign(Size=lambda df: df.Size.apply(display_size))
-                                .filter(['Description', 'Document', 'Type', 'Size']), max_rows=100)
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
-
-
-@dataclass(frozen=True)
-class Attachment:
-    """
-    A document on the filing
-
-    """
-    seq: int
-    description: str
-    document: str
-    form: str
-    size: int
-    path: str
-
-    @property
-    def extension(self):
-        """The actual extension of the filing document
-         Usually one of .xml or .html or .pdf or .txt or .paper
-         """
-        return os.path.splitext(self.path)[1]
-
-    @property
-    def display_extension(self) -> str:
-        """This is the extension displayed in the html e.g. "es220296680_4-davis.html"
-        The actual extension would be "es220296680_4-davis.xml", that displays as html in the browser
-
-        """
-        return os.path.splitext(self.document)[1]
-
-    @property
-    def url(self) -> str:
-        """
-        :return: The full sec url
-        """
-        # Never use the ixbrl viewer
-        # ix.xhtml?doc=/
-        filing_url = f"{sec_dot_gov}{self.path}"
-        # Remove "ix?doc=/" or "ix.xhtml?doc=/" from the filing url
-        return re.sub(r"ix(\.xhtml)?\?doc=/", "", filing_url)
-
-    def open(self):
-        """Open the filing document"""
-        webbrowser.open(self.url)
-
-    @property
-    def name(self) -> str:
-        return os.path.basename(self.path)
-
-    @classmethod
-    def from_dataframe_row(cls, dataframe_row: pd.Series):
-
-        try:
-            size = int(dataframe_row.Size)
-        except ValueError:
-            size = 0
-        return cls(seq=dataframe_row.Seq,
-                   description=dataframe_row.Description,
-                   document=dataframe_row.Document,
-                   form=dataframe_row.Type,
-                   size=size,
-                   path=dataframe_row.Url)
-
-    def is_text(self):
-        """Is this a text document"""
-        return self.extension in text_extensions
-
-    def is_binary(self):
-        """Is this a binary document"""
-        return self.extension in binary_extensions
-
-    def download(self):
-        return download_file(self.url, as_text=self.is_text())
-
-    def summary(self) -> pd.DataFrame:
-        """Return a summary of this filing as a dataframe"""
-        return pd.DataFrame([{'seq': self.seq,
-                              'form': self.form,
-                              'document': self.document,
-                              'description': self.description}]).set_index("seq")
-
-    def __rich__(self):
-        return df_to_rich_table(self.summary(), index_name="seq")
 
     def __repr__(self):
         return repr_rich(self.__rich__())
@@ -1946,202 +1642,6 @@ class FilerInfo:
         return repr_rich(self.__rich__())
 
 
-class FilingHomepage:
-    """
-    A class that represents the homepage for the filing allowing us to get the documents and datafiles
-    """
-
-    def __init__(self,
-                 files: pd.DataFrame,
-                 url: str,
-                 filing: Filing,
-                 filer_infos: List[FilerInfo]):
-        self._files: pd.DataFrame = files
-        self.url: str = url
-        self.filing: Filing = filing
-        self.filer_infos: List[FilerInfo] = filer_infos
-
-    def get_file(self,
-                 *,
-                 seq: int) -> Attachment:
-        """ get the filing document that matches the seq"""
-        res = self._files.query(f"Seq=='{seq}'")
-        if not res.empty:
-            return Attachment.from_dataframe_row(res.iloc[0])
-
-    def open(self):
-        webbrowser.open(self.url)
-
-    def min_seq(self) -> str:
-        """Get the minimum document sequence from the Seq column"""
-        return str(min([int(seq) for seq in self.documents.Seq.tolist() if seq and seq.isdigit()]))
-
-    @property
-    @lru_cache(maxsize=2)
-    def primary_documents(self) -> List[Attachment]:
-        """
-        Get the documents listed as primary for the filing
-        :return:
-        """
-        min_seq = self.min_seq()
-        doc_results = self.documents.query(f"Seq=='{min_seq}'")
-        return [
-            Attachment.from_dataframe_row(self.documents.iloc[index])
-            for index in doc_results.index
-        ]
-
-    @property
-    def primary_xml_document(self) -> Optional[Attachment]:
-        """Get the primary xml document on the filing"""
-        for doc in self.primary_documents:
-            if doc.display_extension == ".xml":
-                return doc
-
-    @property
-    def text_document(self) -> Attachment:
-        """Get the full text submission file"""
-        res = self._files[self._files.Description == "Complete submission text file"]
-        return Attachment.from_dataframe_row(res.iloc[0])
-
-    @property
-    def primary_html_document(self) -> Optional[Attachment]:
-        """Get the primary xml document on the filing"""
-        for doc in self.primary_documents:
-            if doc.display_extension == ".html" or doc.display_extension == '.htm':
-                return doc
-        # Shouldn't get here but just open the first document
-        return self.primary_documents[0]
-
-    @property
-    def xbrl_document(self):
-        """Find and return the xbrl document."""
-
-        # Change from .query syntax due to differences in how pandas executes queries on online environmments
-        matching_files = self._files[self._files.Description.isin(xbrl_document_types)]
-        if not matching_files.empty:
-            rec = matching_files.iloc[0]
-            return Attachment.from_dataframe_row(rec)
-
-    def get_matching_files(self,
-                           query: str) -> pd.DataFrame:
-        """ return the files that match the query"""
-        return self._files.query(query, engine="python").reset_index(drop=True).filter(filing_file_cols)
-
-    @property
-    def documents(self) -> pd.DataFrame:
-        """ returns the files that are in the "Document Format Files" table of the homepage"""
-        return self.get_matching_files("table=='Document Format Files'")
-
-    @property
-    def datafiles(self):
-        """ returns the files that are in the "Data Files" table of the homepage"""
-        return self.get_matching_files("table=='Data Files'")
-
-    @property
-    @lru_cache(maxsize=2)
-    def attachments(self) -> Attachments:
-        return Attachments(self._files)
-
-    @classmethod
-    def from_html(cls,
-                  homepage_html: str,
-                  url: str,
-                  filing: Filing):
-        """Parse the HTML and create the Homepage from it"""
-
-        # It is html so use "html.parser" (instead of "xml", or "lxml")
-        soup = BeautifulSoup(homepage_html, "html.parser")
-
-        # Keep track of the tables as dataframes, so we can append later
-        dfs = []
-
-        # The table containin the attachments
-        tables = soup.find_all("table", class_="tableFile")
-        for table in tables:
-            summary = table.attrs.get("summary")
-            rows = table.find_all("tr")
-            column_names = [th.text for th in rows[0].find_all("th")] + ["Url"]
-            records = []
-
-            # Add the rows from the table
-            for row in rows[1:]:
-                cells = row.find_all("td")
-                link = cells[2].a
-                cell_values = [cell.text for cell in cells] + [link["href"] if link else None]
-                records.append(cell_values)
-
-            # Now create the dataframe
-            table_as_df = (pd.DataFrame(records, columns=column_names)
-                           .filter(filing_file_cols)
-                           .assign(table=summary)
-                           )
-            dfs.append(table_as_df)
-
-        # Now concat into a single dataframe
-        files = pd.concat(dfs, ignore_index=True)
-
-        filer_divs = soup.find_all("div", id="filerDiv")
-        filer_infos = []
-        for filer_div in filer_divs:
-
-            # Get the company name
-            company_info_div = filer_div.find("div", class_="companyInfo")
-
-            company_name_span = company_info_div.find("span", class_="companyName")
-            company_name = (re.sub("\n", "", company_name_span.text.strip())
-                            .replace("(see all company filings)", "").rstrip()
-                            if company_name_span else "")
-
-            # Get the identification information
-            ident_info_div = company_info_div.find("p", class_="identInfo")
-
-            # Relace <br> with newlines
-            for br in ident_info_div.find_all("br"):
-                br.replace_with("\n")
-
-            identification = ident_info_div.text
-
-            # Get the mailing information
-            mailer_divs = filer_div.find_all("div", class_="mailer")
-            # For each mailed_div.text remove mutiple spaces after a newline
-
-            addresses = [re.sub(r'\n\s+', '\n', mailer_div.text.strip())
-                         for mailer_div in mailer_divs]
-
-            # Create the filer info
-            filer_info = FilerInfo(company_name=company_name, identification=identification, addresses=addresses)
-
-            filer_infos.append(filer_info)
-
-        return cls(files,
-                   url=url,
-                   filing=filing,
-                   filer_infos=filer_infos)
-
-    def __str__(self):
-        return f"Homepage for {self.description}"
-
-    def __repr__(self):
-        return repr_rich(self.__rich__())
-
-    def __rich__(self):
-
-        return Panel(
-            Group(
-                df_to_rich_table(self.filing.summary(), index_name="Accession Number"),
-                Group(Text("Documents", style="bold"),
-                      df_to_rich_table(summarize_files(self.documents), index_name="Seq")
-                      ),
-                Group(Text("Datafiles", style="bold"),
-                      df_to_rich_table(summarize_files(self.datafiles), index_name="Seq"),
-                      ) if self.datafiles is not None else Text(""),
-                Group(
-                    *[filer_info.__rich__() for filer_info in self.filer_infos]
-                )
-
-            ), title=f"Form {self.filing.form}")
-
-
 def summarize_files(data: pd.DataFrame) -> pd.DataFrame:
     return (data
             .filter(["Seq", "Document", "Description", "Size"])
@@ -2150,34 +1650,32 @@ def summarize_files(data: pd.DataFrame) -> pd.DataFrame:
             )
 
 
-@lru_cache(maxsize=16)
-def get_by_accession_number(accession_number: str):
-    """Find the filing using the accession number"""
-    assert re.match(r"\d{10}-\d{2}-\d{6}", accession_number), \
-        f"{accession_number} is not a valid accession number .. should be 10digits-2digits-6digits"
-    year = int("19" + accession_number[11:13]) if accession_number[11] == 9 else int("20" + accession_number[11:13])
+@cache_except_none(maxsize=16)
+def get_filing_by_accession(accession_number: str, year: int):
+    """Cache-friendly version that takes year as parameter instead of using datetime.now()"""
+    assert re.match(r"\d{10}-\d{2}-\d{6}", accession_number)
 
-    if year == datetime.now().year:
-        # For the current year create a range of quarters to search from 1 up to the current quarter of the year
-        current_quarter = (datetime.now().month - 1) // 3 + 1
-        quarters = range(1, current_quarter + 1)
-    else:
-        # Search all quarters
-        quarters = range(1, 5)
+    # Static logic that doesn't depend on current time
+    for quarter in range(1, 5):
+        filings = _get_cached_filings(year=year, quarter=quarter)
+        if filings and (filing := filings.get(accession_number)):
+            return filing
 
-    with Status(f"[bold deep_sky_blue1]Searching for filing {accession_number}...", spinner="dots2"):
-        for quarter in quarters:
-            filings = _get_cached_filings(year=year, quarter=quarter)
-            if filings:
-                filing = filings.get(accession_number)
-                if filing:
-                    return filing
-    # We haven't found the filing normally so check the most recent SEC filings
-    # Check if the year is the current year
-    if year == datetime.now().year:
-        # Get the most recent filings
-        filings = get_current_filings()
-        return filings.get(accession_number)
+    return None
+
+
+def get_by_accession_number(accession_number: str, show_progress: bool = True):
+    """Wrapper that handles progress display and current time logic"""
+    year = int("19" + accession_number[11:13]) if accession_number[11] == '9' else int("20" + accession_number[11:13])
+
+    with Status("[bold deep_sky_blue1]Searching...", spinner="dots2") if show_progress else nullcontext():
+        filing = get_filing_by_accession(accession_number, year)
+
+        if not filing and year == datetime.now().year:
+            filings = get_current_filings()
+            filing = filings.get(accession_number)
+
+    return filing
 
 
 def form_with_amendments(*forms: str):

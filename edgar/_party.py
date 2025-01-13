@@ -3,9 +3,12 @@ from typing import List, Optional
 from bs4 import Tag
 from rich.console import Group
 from rich.table import Table
-
-from edgar._rich import repr_rich
-from edgar._xml import child_text, child_value
+from rich.panel import Panel
+from rich.text import Text
+from rich.columns import Columns
+from pydantic import BaseModel
+from edgar.richtools import repr_rich
+from edgar.xmltools import child_text, child_value
 from edgar.core import IntString
 
 __all__ = [
@@ -14,29 +17,55 @@ __all__ = [
     'Person',
     'Name',
     'Filer',
+    'get_addresses_as_columns'
 ]
 
 
-class Address:
+class Address(BaseModel):
 
-    def __init__(self,
-                 street1: Optional[str] = None,
-                 street2: Optional[str] = None,
-                 city: Optional[str] = None,
-                 state_or_country: Optional[str] = None,
-                 state_or_country_description: Optional[str] = None,
-                 zipcode: Optional[str] = None
-                 ):
-        self.street1: str = street1
-        self.street2: Optional[str] = street2
-        self.city: Optional[str] = city
-        self.state_or_country: Optional[str] = state_or_country
-        self.state_or_country_description: Optional[str] = state_or_country_description
-        self.zipcode: Optional[str] = zipcode
+    street1: Optional[str] = None
+    street2: Optional[str] = None
+    city: Optional[str] = None
+    state_or_country: Optional[str] = None
+    state_or_country_description: Optional[str] = None
+    zipcode: Optional[str] = None
+
+    @property
+    def empty(self):
+        return not self.street1 and not self.street2 and not self.city and not self.state_or_country and not self.zipcode
+
+    def __str__(self):
+        if not self.street1:
+            return ""
+        address_format = "{street1}\n"
+        if self.street2:
+            address_format += "{street2}\n"
+        address_format += "{city}, {state_or_country} {zipcode}"
+
+        return address_format.format(
+            street1=self.street1,
+            street2=self.street2,
+            city=self.city,
+            state_or_country=self.state_or_country_description or self.state_or_country,
+            zipcode=self.zipcode or ""
+        )
 
     def __repr__(self):
-        return (f"Address(street1='{self.street1}', street2={self.street2}, city={self.city}, "
-                f"zipcode={self.zipcode}, state={self.state_or_country})")
+        return (f'Address(street1="{self.street1 or ""}", street2="{self.street2 or ""}", city="{self.city or ""}",'
+                f'zipcode="{self.zipcode or ""}", state_or_country="{self.state_or_country} or "")'
+                )
+
+
+def get_addresses_as_columns(mailing_address: Optional[Address], business_address: Optional[Address]) -> Columns:
+    """
+    Returns a rich Columns object with mailing and business addresses
+    """
+    addresses = []
+    if mailing_address and not mailing_address.empty:
+        addresses.append(Panel(Text(str(mailing_address)), title='\U00002709 Mailing Address', width=40))
+    if business_address and not business_address.empty:
+        addresses.append(Panel((Text(str(business_address))), title='\U0001F3E2 Business Address', width=40))
+    return Columns(addresses, equal=True, expand=True)
 
 
 class Issuer:
@@ -145,7 +174,7 @@ class Person:
     def __init__(self,
                  first_name: str,
                  last_name: str,
-                 address: Address = None):
+                 address: Optional[Address] = None):
         self.first_name = first_name
         self.last_name = last_name
         self.address: Address = address
@@ -163,7 +192,7 @@ class Name:
                  first_name: str,
                  middle_name: str,
                  last_name: str,
-                 suffix:str=None):
+                 suffix:Optional[str]=None):
         self.first_name = first_name
         self.middle_name = middle_name
         self.last_name = last_name

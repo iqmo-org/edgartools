@@ -1,5 +1,7 @@
+import asyncio
 import datetime
 import gzip
+import logging.config
 import os
 import random
 import re
@@ -10,9 +12,12 @@ from _thread import interrupt_main
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache
-from io import BytesIO
+from functools import wraps
 from typing import Union, Optional, Tuple, List
 import logging
+from pathlib import Path
+from datetime import date
+import pytz
 import httpx
 import humanize
 import pandas as pd
@@ -22,6 +27,8 @@ from charset_normalizer import detect
 from fastcore.basics import listify
 from retry.api import retry_call
 #from rich.logging import RichHandler
+from pandas.tseries.offsets import BDay
+from rich.logging import RichHandler
 from rich.prompt import Prompt
 
 
@@ -59,25 +66,44 @@ __all__ = [
     'pandas_version',
     'python_version',
     'set_identity',
-    'download_text',
-    'download_json',
-    'download_file',
+    'listify',
     'decode_content',
     'filter_by_date',
     'filter_by_form',
+    'filter_by_cik',
+    'filter_by_ticker',
+    'filter_by_accession_number',
+    'split_camel_case',
+    'cache_except_none',
     'text_extensions',
+    'binary_extensions',
     'ask_for_identity',
+    'is_start_of_quarter',
+    'run_async_or_sync',
+    'get_edgar_data_directory',
+    'has_html_content',
     'default_page_size',
+    'parse_acceptance_datetime',
     'InvalidDateException',
-    'get_text_between_tags'
+    'Years',
+    'Quarters',
+    'YearAndQuarter',
+    'YearAndQuarters',
+    'quarters_in_year',
 ]
 
 IntString = Union[str, int]
+quarters_in_year: List[int] = list(range(1, 5))
+
+YearAndQuarter = Tuple[int, int]
+YearAndQuarters = List[YearAndQuarter]
+Years = Union[int, List[int], range]
+Quarters = Union[int, List[int], range]
 
 # Date patterns
 YYYY_MM_DD = "\\d{4}-\\d{2}-\\d{2}"
 DATE_PATTERN = re.compile(YYYY_MM_DD)
-DATE_RANGE_PATTERN = re.compile(f"({YYYY_MM_DD})?:?(({YYYY_MM_DD})?)?")
+DATE_RANGE_PATTERN = re.compile(f"^({YYYY_MM_DD}(:({YYYY_MM_DD})?)?|:({YYYY_MM_DD}))$")
 
 default_http_timeout: int = 12
 default_page_size = 50
@@ -110,22 +136,33 @@ class EdgarSettings:
 # Modes of accessing edgar
 
 # The normal mode of accessing edgar
-NORMAL = EdgarSettings(http_timeout=12, max_connections=10)
+NORMAL = EdgarSettings(http_timeout=15, max_connections=10)
 
 # A bit more cautious mode of accessing edgar
-CAUTION = EdgarSettings(http_timeout=15, max_connections=5)
+CAUTION = EdgarSettings(http_timeout=20, max_connections=5)
 
 # Use this setting when you have long-running jobs and want to avoid breaching Edgar limits
-CRAWL = EdgarSettings(http_timeout=20, max_connections=2, retries=2)
+CRAWL = EdgarSettings(http_timeout=25, max_connections=2, retries=2)
 
-# Use normal mode
-edgar_mode = NORMAL
+edgar_access_mode = os.getenv('EDGAR_ACCESS_MODE', 'NORMAL')
+if edgar_access_mode == 'CAUTION':
+    # A bit more cautious mode of accessing edgar
+    edgar_mode = CAUTION
+elif edgar_access_mode == 'CRAWL':
+    # Use this setting when you have long-running jobs and want to avoid breaching Edgar limits
+    edgar_mode = CRAWL
+else:
+    # The normal mode of accessing edgar
+    edgar_mode = NORMAL
 
 edgar_identity = 'EDGAR_IDENTITY'
 
 # SEC urls
 sec_dot_gov = "https://www.sec.gov"
 sec_edgar = "https://www.sec.gov/Archives/edgar"
+
+# Local storage directory.
+edgar_data_dir = os.path.join(os.path.expanduser("~"), ".edgar")
 
 
 def set_identity(user_identity: str):
@@ -203,44 +240,141 @@ def get_identity() -> str:
     return identity
 
 
+@lru_cache(maxsize=None)
+def get_edgar_data_directory() -> Path:
+    """Get the edgar data directory"""
+    default_local_data_dir = Path(os.path.join(os.path.expanduser("~"), ".edgar"))
+    edgar_data_dir = Path(os.getenv('EDGAR_LOCAL_DATA_DIR', default_local_data_dir))
+    if not edgar_data_dir.exists():
+        os.makedirs(edgar_data_dir)
+    return edgar_data_dir
+
+
 class InvalidDateException(Exception):
 
     def __init__(self, message: str):
         super().__init__(message)
 
 
-def extract_dates(date: str) -> Tuple[Optional[str], Optional[str], bool]:
+class TooManyRequestsException(Exception):
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
+def extract_dates(date_str: str) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime], bool]:
     """
     Split a date or a date range into start_date and end_date
-    >>> split_date("2022-03-04")
-          2022-03-04, None, False
-    >>> split_date("2022-03-04:2022-04-05")
-        2022-03-04, 2022-04-05, True
-    >>> split_date("2022-03-04:")
-        2022-03-04, None, True
-    >>> split_date(":2022-03-04")
-        None, 2022-03-04, True
-    :param date: The date to split
-    :return:
+    Examples:
+        extract_dates("2022-03-04") -> 2022-03-04, None, False
+        extract_dates("2022-03-04:2022-04-05") -> 2022-03-04, 2022-04-05, True
+        extract_dates("2022-03-04:") -> 2022-03-04, <current_date>, True
+        extract_dates(":2022-03-04") -> 1994-07-01, 2022-03-04, True
+
+    Args:
+        date_str: Date string in YYYY-MM-DD format, optionally with a range separator ':'
+
+    Returns:
+        Tuple of (start_date, end_date, is_range) where dates are datetime objects
+        and is_range indicates if this was a date range query
+
+    Raises:
+        InvalidDateException: If the date string cannot be parsed
     """
-    match = re.match(DATE_RANGE_PATTERN, date)
-    if match:
-        start_date, _, end_date = match.groups()
-        try:
-            start_date_tm = datetime.datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
-            end_date_tm = datetime.datetime.strptime(end_date, "%Y-%m-%d") if end_date else None
-            if start_date_tm or end_date_tm:
-                return start_date_tm, end_date_tm, ":" in date
-        except ValueError:
-            log.error(f"The date {date} cannot be extracted using date pattern YYYY-MM-DD")
-    raise InvalidDateException(f"""
-    Cannot extract a date or date range from string {date}
-    Provide either 
-        1. A date in the format "YYYY-MM-DD" e.g. "2022-10-27"
-        2. A date range in the format "YYYY-MM-DD:YYYY-MM-DD" e.g. "2022-10-01:2022-10-27"
-        3. A partial date range "YYYY-MM-DD:" to specify dates after the value e.g.  "2022-10-01:"
-        4. A partial date range ":YYYY-MM-DD" to specify dates before the value  e.g. ":2022-10-27"
-    """)
+    if not date_str:
+        raise InvalidDateException("Empty date string provided")
+
+    try:
+        # Split on colon, handling the single date case
+        has_colon = ':' in date_str
+        parts = date_str.split(':') if has_colon else [date_str]
+
+        # Handle invalid formats
+        if len(parts) != (2 if has_colon else 1):
+            raise InvalidDateException("Invalid date range format")
+
+        # Parse start date
+        if not has_colon or parts[0]:
+            start_date = datetime.datetime.strptime(parts[0], "%Y-%m-%d")
+        else:
+            start_date = datetime.datetime.strptime('1994-07-01', '%Y-%m-%d')
+
+        # Parse end date
+        if has_colon and parts[1]:
+            end_date = datetime.datetime.strptime(parts[1], "%Y-%m-%d")
+        elif has_colon:
+            end_date = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            end_date = None
+
+        # Validate date order if both dates are present
+        if has_colon and end_date and start_date > end_date:
+            raise InvalidDateException(
+                f"Invalid date range: start date ({start_date.date()}) "
+                f"cannot be after end date ({end_date.date()})"
+            )
+
+        return start_date, end_date, has_colon
+
+    except ValueError as e:
+        raise InvalidDateException(f"""
+        Cannot extract a date or date range from string {date_str}
+        Provide either 
+            1. A date in the format "YYYY-MM-DD" e.g. "2022-10-27"
+            2. A date range in the format "YYYY-MM-DD:YYYY-MM-DD" e.g. "2022-10-01:2022-10-27"
+            3. A partial date range "YYYY-MM-DD:" to specify dates after the value e.g.  "2022-10-01:"
+            4. A partial date range ":YYYY-MM-DD" to specify dates before the value  e.g. ":2022-10-27"
+        """) from e
+
+
+def filing_date_to_year_quarters(filing_date: str) -> List[Tuple[int, int]]:
+    if ":" in filing_date:
+        start_date, end_date = filing_date.split(":")
+
+        if not start_date:
+            start_date = "1994-06-01"
+
+        if not end_date:
+            end_date = date.today().strftime("%Y-%m-%d")
+
+        start_year, start_month, _ = map(int, start_date.split("-"))
+        end_year, end_month, _ = map(int, end_date.split("-"))
+
+        start_quarter = (start_month - 1) // 3 + 1
+        end_quarter = (end_month - 1) // 3 + 1
+
+        result = []
+        for year in range(start_year, end_year + 1):
+            if year == start_year and year == end_year:
+                quarters = range(start_quarter, end_quarter + 1)
+            elif year == start_year:
+                quarters = range(start_quarter, 5)
+            elif year == end_year:
+                quarters = range(1, end_quarter + 1)
+            else:
+                quarters = range(1, 5)
+
+            for quarter in quarters:
+                result.append((year, quarter))
+
+        return result
+    else:
+        year, month, _ = map(int, filing_date.split("-"))
+        quarter = (month - 1) // 3 + 1
+        return [(year, quarter)]
+
+
+def current_year_and_quarter() -> Tuple[int, int]:
+    # Define the Eastern timezone
+    eastern = pytz.timezone('America/New_York')
+
+    # Get the current time in Eastern timezone
+    now_eastern = datetime.datetime.now(eastern)
+
+    # Calculate the current year and quarter
+    current_year, current_quarter = now_eastern.year, (now_eastern.month - 1) // 3 + 1
+
+    return current_year, current_quarter
 
 
 def filter_by_date(data: pa.Table,
@@ -265,21 +399,50 @@ def filter_by_date(data: pa.Table,
     return filtered_data
 
 
+def filter_by_accession_number(data: pa.Table,
+                               accession_number: Union[IntString, List[IntString]]) -> pa.Table:
+    """Return the data filtered by accession number"""
+    # Ensure that forms is a list of strings ... it can accept int like form 3, 4, 5
+    accession_numbers = [str(el) for el in listify(accession_number)]
+    data = data.filter(pc.is_in(data['accession_number'], pa.array(accession_numbers)))
+    return data
+
+
 def filter_by_form(data: pa.Table,
                    form: Union[str, List[str]],
                    amendments: bool = True) -> pa.Table:
     """Return the data filtered by form"""
     # Ensure that forms is a list of strings ... it can accept int like form 3, 4, 5
     forms = [str(el) for el in listify(form)]
-    # If amendments then add amendments
     if amendments:
         forms = list(set(forms + [f"{val}/A" for val in forms]))
+    else:
+        forms = list(set([val.replace("/A", "") for val in forms]))
     data = data.filter(pc.is_in(data['form'], pa.array(forms)))
     return data
 
 
-def autodetect(content):
-    return detect(content).get("encoding")
+def filter_by_cik(data: pa.Table,
+                  cik: Union[IntString, List[IntString]]) -> pa.Table:
+    """Return the data filtered by form"""
+    # Ensure that forms is a list of strings ... it can accept int like form 3, 4, 5
+    ciks = [int(el) for el in listify(cik)]
+    data = data.filter(pc.is_in(data['cik'], pa.array(ciks)))
+    return data
+
+
+def filter_by_ticker(data: pa.Table,
+                     ticker: Union[str, List[str]]) -> pa.Table:
+    """Return the data filtered by form"""
+    # Ensure that forms is a list of strings ... it can accept int like form 3, 4, 5
+    from edgar.reference.tickers import get_cik_tickers
+    company_tickers = get_cik_tickers()
+    tickers = listify(ticker)
+    filtered_tickers = company_tickers[company_tickers.ticker.isin(tickers)]
+    ciks = filtered_tickers.cik.tolist()
+    return filter_by_cik(data, cik=ciks)
+
+    # return data
 
 
 @lru_cache(maxsize=1)
@@ -288,15 +451,18 @@ def client_headers():
 
 client = None
 def http_client():
-    global client
-    if client is None:
+    return httpx.Client(headers=client_headers(),
+                        timeout=edgar_mode.http_timeout,
+                        limits=edgar_mode.limits,
+                        default_encoding="utf-8")
 
-        log.info("Creating new HTTP client")
-        client = httpx.Client(headers=client_headers(),
-                            timeout=edgar_mode.http_timeout,
-                            limits=edgar_mode.limits,
-                            default_encoding=autodetect)
-    return client
+
+def async_http_client():
+    return httpx.AsyncClient(headers=client_headers(),
+                             timeout=edgar_mode.http_timeout,
+                             limits=edgar_mode.limits,
+                             default_encoding='utf-8')
+
     
 def get_json(data_url: str):
     client = http_client()
@@ -313,80 +479,34 @@ def decode_content(content: bytes):
         return content.decode('latin-1')
 
 
-text_extensions = [".txt", ".htm", ".html", ".xsd", ".xml", "XML", ".json", ".idx"]
-binary_extensions = [".pdf", ".jpg", ".jpeg", "png", ".gif", ".tif", ".tiff", ".bmp", ".ico", ".svg", ".webp", ".avif",
-                     ".apng"]
+text_extensions = (".txt", ".htm", ".html", ".xsd", ".xml", "XML", ".json", ".idx", ".paper")
+binary_extensions = (".pdf", ".jpg", ".jpeg", "png", ".gif", ".tif", ".tiff", ".bmp", ".ico", ".svg", ".webp", ".avif",
+                     ".apng")
 
 
-def download_file(url: str,
-                  client: Union[httpx.Client, httpx.AsyncClient] = None,
-                  as_text: bool = None):
-    # reason_phrase = 'Too Many Requests' status_code = 429
-    if not client:
-        client = http_client()
+def extract_text_between_tags(content: str, tag: str) -> str:
+    """
+    Extracts text from provided content between the specified HTML/XML tags.
 
-    if not as_text:
-        # Set the default to true if the url ends with a text extension
-        as_text = any([url.endswith(ext) for ext in text_extensions])
-
-    r = retry_call(client.get, fargs=[url], tries=5, delay=3)
-    # If we get a 301 or 302, follow the redirect
-    if r.status_code in [301, 302]:
-        return download_file(r.headers['Location'], client, as_text)
-    if r.status_code == 200:
-        if url.endswith("gz"):
-            binary_file = BytesIO(r.content)
-            with gzip.open(binary_file, 'rb') as f:
-                file_content = f.read()
-                if as_text:
-                    return decode_content(file_content)
-                return file_content
-        else:
-            # If we explicitely asked for text or there is an encoding, try to return text
-            if as_text:
-                return r.text
-            # Should get here for jpg and PDFs
-            return r.content
-    else:
-        r.raise_for_status()
-
-
-def download_text(url: str, client: Union[httpx.Client, httpx.AsyncClient] = None):
-    return download_file(url, client, as_text=True)
-
-
-def download_json(data_url: str):
-    r = http_client().get(data_url)
-    if r.status_code == 200:
-        return r.json()
-    r.raise_for_status()
-
-
-def get_text_between_tags(url: str, tag: str, client: Union[httpx.Client, httpx.AsyncClient] = None):
-    if not client:
-        client = http_client()
+    :param content: The text content to search through
+    :param tag: The tag to extract the content from
+    :return: The extracted text between the tags
+    """
     tag_start = f'<{tag}>'
     tag_end = f'</{tag}>'
-    is_header = False
-    content = ""
+    is_tag = False
+    extracted_content = ""
 
-    with retry_call(client.stream, fargs=['GET', url], tries=5, delay=3) as response:
+    for line in content.splitlines():
+        if line.startswith(tag_start):
+            is_tag = True
+            continue  # Skip the start tag line
+        elif line.startswith(tag_end):
+            break  # Stop reading if end tag is found
+        elif is_tag:
+            extracted_content += line + '\n'  # Add line to result
 
-        for line in response.iter_lines():
-            if line:
-                # If line matches header_start, start capturing
-                if line.startswith(tag_start):
-                    is_header = True
-                    continue  # Skip the current line as it's the opening tag
-
-                # If line matches header_end, stop capturing
-                elif line.startswith(tag_end):
-                    break
-
-                # If within header lines, add to header_content
-                elif is_header:
-                    content += line + '\n'  # Add a newline to preserve original line breaks
-    return content
+    return extracted_content.strip()
 
 
 def repr_df(df, hide_index: bool = True):
@@ -415,8 +535,8 @@ class Result:
 
     def __init__(self,
                  success: bool,
-                 error: str,
-                 value: object):
+                 error: Optional[str] = None,
+                 value: Optional[object] = None):
         self.success = success
         self.error = error
         self.value = value
@@ -457,7 +577,7 @@ def get_resource(file: str):
     return importlib.resources.path(edgar, file)
 
 
-def display_size(size: Optional[int]) -> str:
+def display_size(size: Optional[Union[int, str]]) -> str:
     """
     :return the size in KB or MB as a string
     """
@@ -476,9 +596,15 @@ class DataPager:
         self.total_pages = (len(self.data) // page_size) + 1
         self.current_page = 1
 
+    def has_next(self):
+        return self.current_page < self.total_pages
+
+    def has_previous(self):
+        return self.current_page > 1
+
     def next(self):
         """Get the next page of data"""
-        if self.current_page < self.total_pages:
+        if self.has_next():
             self.current_page += 1
             return self.current()
         else:
@@ -486,7 +612,7 @@ class DataPager:
 
     def previous(self):
         """Get the previous page of data"""
-        if self.current_page > 1:
+        if self.has_previous():
             self.current_page -= 1
             return self.current()
         else:
@@ -510,6 +636,14 @@ class DataPager:
             return self.data.slice(offset=start_index, length=self.page_size)
         else:
             return self.data.iloc[start_index:end_index]
+
+    @property
+    def start_index(self):
+        return (self.current_page - 1) * self.page_size
+
+    @property
+    def end_index(self):
+        return self.start_index + self.page_size
 
 
 def moneyfmt(value, places=0, curr='$', sep=',', dp='.',
@@ -572,9 +706,14 @@ def datefmt(value: Union[datetime.datetime, str], fmt: str = "%Y-%m-%d") -> str:
         # If value matches %Y%m%d%H%M%s, then parse it
         elif re.match(r"^\d{14}$", value):
             value = datetime.datetime.strptime(value, "%Y%m%d%H%M%S")
+        elif re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+            value = datetime.datetime.strptime(value, "%Y-%m-%d")
         return value.strftime(fmt)
     else:
         return value.strftime(fmt)
+
+def parse_acceptance_datetime(acceptance_datetime: str) -> datetime.datetime:
+    return datetime.datetime.fromisoformat(acceptance_datetime.replace('Z', '+00:00'))
 
 
 def sample_table(table, n=None, frac=None, replace=False, random_state=None):
@@ -600,18 +739,22 @@ def reverse_name(name):
     # Split the name into parts
     parts = name.split()
 
+    # Return immediately if there's only one name part
+    if len(parts) == 1:
+        return parts[0].title()
+
     # Handle the cases where there's a 'Jr', 'Sr', 'II', 'III', 'MD', etc., or 'ET AL'
-    special_parts = ['Jr', 'Sr', 'II', 'III', 'MD', 'ET', 'AL', 'et', 'al']
+    special_parts = ['Jr', 'JR', 'Sr', 'SR', 'II', 'III', 'MD', 'ET', 'AL', 'et', 'al']
     special_parts_with_period = [part + '.' for part in special_parts if part not in ['II', 'III']] + special_parts
     special_part_indices = [i for i, part in enumerate(parts) if part in special_parts_with_period or (
-                i > 0 and parts[i - 1].rstrip('.') + ' ' + part.rstrip('.') == 'ET AL')]
+            i > 0 and parts[i - 1].rstrip('.') + ' ' + part.rstrip('.') == 'ET AL')]
 
     # Extract the special parts and the main name parts
     special_parts_list = [parts[i] for i in special_part_indices]
     main_name_parts = [part for i, part in enumerate(parts) if i not in special_part_indices]
 
-    # Handle initials in the name (e.g., 'K. Michelle')
-    if '.' in main_name_parts[-2] or len(main_name_parts[-2]) == 1:
+    # Handle initials in the name
+    if len(main_name_parts) > 2 and (('.' in main_name_parts[-2] or len(main_name_parts[-2]) == 1)):
         main_name_parts = [' '.join(main_name_parts[:-2]).title()] + [
             f"{main_name_parts[-1].title()} {main_name_parts[-2]}"]
     else:
@@ -630,3 +773,159 @@ def reverse_name(name):
 
 def yes_no(value: bool) -> str:
     return "Yes" if value else "No"
+
+
+def split_camel_case(item):
+    # Check if the string is all uppercase or all lowercase
+    if item.isupper() or item.islower():
+        return item
+    else:
+        # Split at the boundary between uppercase and lowercase, and between lowercase and uppercase
+        words = re.findall(r'[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+|[A-Z]?[a-z]+|\W+', item)
+        # Join the words, preserving consecutive uppercase words
+        result = []
+        for i, word in enumerate(words):
+            if i > 0 and word.isupper() and words[i - 1].isupper():
+                result[-1] += word
+            else:
+                result.append(word)
+        return ' '.join(result)
+
+
+def run_async_or_sync(coroutine):
+    try:
+        # Check if we're in an IPython environment
+        ipython = sys.modules['IPython']
+        if 'asyncio' in sys.modules:
+            # try is needed for ipython console
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                import nest_asyncio
+                nest_asyncio.apply()
+                loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're in a notebook with an active event loop
+                import nest_asyncio
+                nest_asyncio.apply()
+                return loop.run_until_complete(coroutine)
+            else:
+                # We're in IPython but without an active event loop
+                return loop.run_until_complete(coroutine)
+        else:
+            # We're in IPython but asyncio is not available
+            return ipython.get_ipython().run_cell_magic('time', '', f'import asyncio; asyncio.run({coroutine!r})')
+    except (KeyError, AttributeError):
+        # We're not in an IPython environment, use asyncio.run()
+        return asyncio.run(coroutine)
+
+
+def listify(value):
+    """
+    Convert the input to a list if it's not already a list.
+
+    Args:
+    value: Any type of input
+
+    Returns:
+    list: The input as a list
+    """
+    if isinstance(value, list):
+        return value
+    elif isinstance(value, range):
+        return list(value)
+    else:
+        return [value]
+
+
+def is_start_of_quarter():
+    today = datetime.datetime.now().date()
+
+    # Check if it's the start of a quarter
+    if today.month in [1, 4, 7, 10] and today.day <= 5:
+        # Get the first day of the current quarter
+        first_day_of_quarter = datetime.datetime(today.year, today.month, 1).date()
+
+        # Calculate one business day after the start of the quarter
+        one_business_day_after = (first_day_of_quarter + BDay(1)).date()
+
+        # Check if we haven't passed one full business day yet
+        if today <= one_business_day_after:
+            return True
+
+    return False
+
+
+def format_date(date: Union[str, datetime.datetime], fmt: str = "%Y-%m-%d") -> str:
+    """
+    Format a date as a string
+    :param date: The date to format
+    :param fmt: The format to use
+    :return: The formatted date
+    """
+    if isinstance(date, str):
+        return date
+    else:
+        return date.strftime(fmt)
+
+
+def cache_except_none(maxsize=128):
+    """
+    A decorator that caches the result of a function, but only if the result is not None.
+    """
+    def decorator(func):
+        cache = lru_cache(maxsize=maxsize)
+
+        @cache
+        def cached_func(*args, **kwargs):
+            result = func(*args, **kwargs)
+            if result is None:
+                # Clear this result from the cache
+                cached_func.cache_clear()
+            return result
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            return cached_func(*args, **kwargs)
+
+        # Preserve cache methods
+        wrapper.cache_info = cached_func.cache_info
+        wrapper.cache_clear = cached_func.cache_clear
+        return wrapper
+
+    return decorator
+
+
+def has_html_content(content: str) -> bool:
+    """
+    Check if the content is HTML or inline XBRL HTML
+    """
+    if isinstance(content, bytes):
+        content = content.decode('utf-8', errors='ignore')
+
+    # Strip only leading whitespace and get first 200 chars for doctype check
+    content = content.lstrip()
+    first_200_lower = content[:200].lower()
+
+    # Check for XHTML doctype declarations
+    if '<!doctype html public "-//w3c//dtd xhtml' in first_200_lower or \
+            '<!doctype html system "http://www.w3.org/tr/xhtml1/dtd/' in first_200_lower or \
+            '<!doctype html public "-//w3c//dtd html 4.01 transitional//en"' in first_200_lower:
+        return True
+
+    # Look for common XML/HTML indicators in first 1000 chars
+    first_1000 = content[:1000]
+
+    # Check for standard XHTML namespace
+    if 'xmlns="http://www.w3.org/1999/xhtml"' in first_1000:
+        return True
+
+    # Check for HTML root element
+    if '<html' in first_1000:
+        # Check for common inline XBRL namespaces
+        if ('xmlns:xbrli' in first_1000 or
+                'xmlns:ix' in first_1000 or
+                'xmlns:html' in first_1000):
+            return True
+
+    return False
